@@ -26,110 +26,81 @@ try:
 except Exception:
     pycountry = None
 
-# === Data backend selector (local | hf | auto) ===
-import os
-from pathlib import Path
+# === Hugging Face hub helpers (added) ===
 try:
     from huggingface_hub import hf_hub_download, list_repo_files
 except Exception:
     hf_hub_download = None
     list_repo_files = None
 
-def _secret_or_env(k, default=""):
+HF_REPO_ID   = "pjsimba16/adb-climate-data"  # <— your Space
+HF_REPO_PREF = ("space", "dataset")          # try Space first; then dataset fallback
+
+def _get_hf_token() -> str:
     try:
-        if hasattr(st, "secrets") and k in st.secrets:
-            return st.secrets[k]
+        if hasattr(st, "secrets"):
+            tok = st.secrets.get("HF_TOKEN")
+            if tok:
+                return str(tok)
     except Exception:
         pass
-    return os.getenv(k, default)
+    return os.getenv("HF_TOKEN", "")
 
-DATA_BACKEND_OVERRIDE = os.getenv("DATA_BACKEND", "auto")  # "local" | "hf" | "auto"
-HF_REPO_ID   = _secret_or_env("HF_REPO_ID",   "pjsimba16/adb-climate-data")
-HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE", "space")      # "space" or "dataset"
-HF_TOKEN     = _secret_or_env("HF_TOKEN",     "")
+def _hf_download(relpath: str) -> Optional[str]:
+    """
+    Download a file from HF Space/Dataset to local cache and return the local path.
+    relpath like 'country_data/PHL/Monthly/PHL_ADM0_data.parquet'
+    """
+    if hf_hub_download is None:
+        return None
+    last_err = None
+    tok = _get_hf_token()
+    for repo_type in HF_REPO_PREF:
+        try:
+            fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type=repo_type,
+                                 filename=relpath, token=tok)
+            return fp
+        except Exception as e:
+            last_err = e
+            continue
+    st.session_state.setdefault("hf_errors", []).append(f"hf_download failed for {relpath}: {last_err}")
+    return None
 
-def _resolve_backend() -> str:
-    # allow ?backend=hf in URL, or st.secrets["DATA_BACKEND"], or env var
-    qp = {}
+def _hf_list_country_isos() -> List[str]:
+    """
+    List unique ISO3 folders under country_data/ from the HF repo.
+    """
+    if list_repo_files is None:
+        return []
     try:
-        qp = st.query_params
+        files = list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_PREF[0], token=_get_hf_token())
     except Exception:
-        pass
-    if qp:
-        b = str(qp.get("backend", [""])[0]).lower()
-        if b in ("local","hf","auto"): return b
-    if hasattr(st, "secrets"):
-        v = str(st.secrets.get("DATA_BACKEND","auto")).lower()
-        if v in ("local","hf","auto"): return v
-    ov = str(DATA_BACKEND_OVERRIDE or "auto").lower()
-    return ov if ov in ("local","hf","auto") else "auto"
+        # fallback repo_type
+        try:
+            files = list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_PREF[1], token=_get_hf_token())
+        except Exception:
+            return []
+    isos = []
+    for f in files:
+        parts = f.split("/")
+        if len(parts) >= 3 and parts[0] == "country_data" and len(parts[1]) == 3:
+            isos.append(parts[1].upper())
+    return sorted(set(isos))
 
-DATA_BACKEND = _resolve_backend()
-ROOT = Path(__file__).resolve().parents[1]  # project root (…/app)
-COUNTRY_DATA_DIR = next((p for p in [
-    ROOT / "country_data",
-    Path.cwd() / "country_data",
-    Path("/mnt/data/country_data"),
-] if p.exists()), ROOT / "country_data")
-
-def _rel_from_country_data(p: Path) -> str:
-    # convert local file path to "country_data/ISO/Freq/…parquet"
+def _hf_read_parquet(relpath: str, columns=None) -> Optional[pd.DataFrame]:
+    """
+    Read a parquet by repository-relative path from HF.
+    """
+    local = _hf_download(relpath)
+    if not local:
+        return None
     try:
-        return "country_data/" + str(p.relative_to(COUNTRY_DATA_DIR)).replace("\\","/")
-    except Exception:
+        return pd.read_parquet(local, columns=columns)
+    except Exception as e:
+        st.session_state.setdefault("hf_errors", []).append(f"read_parquet({relpath}) failed: {e}")
         return None
 
-def _read_parquet_local(p: Path, columns=None):
-    return pd.read_parquet(p, columns=columns)  # let it raise if missing
-
-def _read_parquet_hf(relpath: str, columns=None):
-    if hf_hub_download is None:
-        raise FileNotFoundError("huggingface_hub not available.")
-    fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
-                         filename=relpath, token=HF_TOKEN)
-    return pd.read_parquet(fp, columns=columns)
-
-def read_parquet_smart(p: Path, columns=None):
-    """
-    Tries local first (if backend=local or auto+exists). Otherwise loads from HF.
-    'p' must be a path under COUNTRY_DATA_DIR.
-    """
-    use = DATA_BACKEND
-    if use in ("local","auto") and p.exists():
-        return _read_parquet_local(p, columns=columns)
-    rel = _rel_from_country_data(p)
-    if use in ("hf","auto") and rel:
-        return _read_parquet_hf(rel, columns=columns)
-    # last attempt: local (to surface the original error)
-    return _read_parquet_local(p, columns=columns)
-
-def _adm0_fp(iso: str, freq: str) -> Path:
-    folder = {"Monthly":"Monthly","Seasonal":"Seasonal","Annual":"Annual"}[freq]
-    return COUNTRY_DATA_DIR / iso.upper() / folder / f"{iso.upper()}_ADM0_data.parquet"
-
-def _to_date_from_parts(df: pd.DataFrame, freq: str) -> pd.Series:
-    if freq == "Monthly":
-        y = pd.to_numeric(df["Year"], errors="coerce")
-        m = pd.to_numeric(df["Month"], errors="coerce")
-        return pd.to_datetime(dict(year=y, month=m, day=1), errors="coerce")
-    if freq == "Seasonal":
-        # accept Season like "DJF","MAM","JJA","SON" or "Q1" etc.
-        s = df["Season"].astype(str)
-        # try quarter first
-        q = s.str.extract(r"Q([1-4])", expand=False).astype(float)
-        if q.notna().any():
-            month = q.map({1:1,2:4,3:7,4:10})
-            y = pd.to_numeric(df.get("Year"), errors="coerce")
-            return pd.to_datetime(dict(year=y, month=month, day=1), errors="coerce")
-        # fallback DJF/MAM/JJA/SON
-        SEASON_TO_MONTH = {"DJF": 2, "MAM": 5, "JJA": 8, "SON": 11}
-        y = pd.to_numeric(df.get("Year"), errors="coerce")
-        anchor = s.str.upper().map(SEASON_TO_MONTH).fillna(2).astype(int)
-        return pd.to_datetime(dict(year=y, month=anchor, day=1), errors="coerce")
-    y = pd.to_numeric(df["Year"], errors="coerce")
-    return pd.to_datetime(dict(year=y, month=7, day=1), errors="coerce")
-
-
+# === Page config/UI (unchanged) ===
 st.set_page_config(
     page_title="Home Page — Global Database of Subnational Climate Indicators",
     layout="wide",
@@ -180,7 +151,7 @@ def _note_err(msg: str):
 # =========================
 # CONFIG: local data + mapper
 # =========================
-COUNTRY_DATA_ROOT = Path("country_data")  # ← at the same level as this file
+COUNTRY_DATA_ROOT = Path("country_data")  # expected local root (kept)
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _read_indicator_mapper() -> Optional[pd.DataFrame]:
@@ -192,15 +163,27 @@ def _read_indicator_mapper() -> Optional[pd.DataFrame]:
                 return pd.read_csv(p)
             except Exception as e:
                 _note_err(f"Mapper read failed for {p}: {e}")
-    _note_err("indicator_code_mapper.csv not found locally.")
+    # HF fallback for indicator_code_mapper.csv
+    for rp in ("indicator_code_mapper.csv", "country_data/indicator_code_mapper.csv"):
+        df = _hf_read_parquet(rp)  # will fail because CSV; try below
+        if df is not None:
+            return df
+        # try CSV via hub
+        fp = _hf_download(rp)
+        if fp:
+            try:
+                return pd.read_csv(fp)
+            except Exception as e:
+                _note_err(f"Mapper hub CSV read failed for {rp}: {e}")
+    _note_err("indicator_code_mapper.csv not found (local/HF).")
     return None
 
 def _suffixes_for_freq() -> Dict[str, list]:
     # Accept standard + legacy suffixes
     return {
         "Annual":   ["_A"],
-        "Seasonal": ["_AS", "_PS"],
-        "Monthly":  ["_AM", "_PM"],
+        "Seasonal": ["_AS", "_PS", "_S"],
+        "Monthly":  ["_AM", "_PM", "_M"],
     }
 
 def _any_column_for_type(cols: List[str], codes_for_type: Set[str], suffixes: List[str]) -> bool:
@@ -214,12 +197,18 @@ def _any_column_for_type(cols: List[str], codes_for_type: Set[str], suffixes: Li
     return False
 
 def _country_dirs(root: Path) -> List[Path]:
+    """
+    Keep local behavior; only used when local files exist.
+    For HF-only deployments, we'll enumerate ISOs via _list_available_isos().
+    """
     if not root.exists(): return []
     return [p for p in root.iterdir() if p.is_dir() and len(p.name) == 3]
 
-def _adm0_file(iso3: str, freq: str, root: Path) -> Path:
-    # ADM0 only (per your instruction for availability & snapshot)
-    return root / iso3 / freq / f"{iso3}_ADM0_data.parquet"
+def _adm0_file_local(iso3: str, freq: str) -> Path:
+    return COUNTRY_DATA_ROOT / iso3 / freq / f"{iso3}_ADM0_data.parquet"
+
+def _adm0_relpath(iso3: str, freq: str) -> str:
+    return f"country_data/{iso3}/{freq}/{iso3}_ADM0_data.parquet"
 
 def _canonical_type(t: str) -> str:
     t = (t or "").strip().lower()
@@ -234,16 +223,34 @@ def _canonical_type(t: str) -> str:
     return (t or "").strip().title()  # fallback: title-case
 
 @st.cache_data(ttl=12*3600, show_spinner=False)
+def _list_available_isos() -> List[str]:
+    """
+    Prefer local folder list; fallback to HF repo listing.
+    """
+    if COUNTRY_DATA_ROOT.exists():
+        out = []
+        for d in sorted(COUNTRY_DATA_ROOT.iterdir()):
+            try:
+                if d.is_dir() and len(d.name) == 3:
+                    out.append(d.name.upper())
+            except Exception:
+                continue
+        if out:
+            return out
+    # HF fallback
+    return _hf_list_country_isos()
+
+@st.cache_data(ttl=12*3600, show_spinner=False)
 def _scan_local_availability(country_data_root: Path, mapper: Optional[pd.DataFrame]):
     """
     Returns:
       - type_to_isos: dict[type] -> set(ISO3) where ADM0 (any freq) has any column mapped to that Type
       - available_types: list of unique Types from mapper (sorted)
+    Extended to use HF when local files are missing.
     """
     type_to_isos: Dict[str, Set[str]] = {}
     available_types: List[str] = []
 
-    # Representative codes (for signal detection / fallback)
     rep_codes = {
         "Temperature": {"TMPA"},
         "Humidity": {"HUMA"},
@@ -259,10 +266,8 @@ def _scan_local_availability(country_data_root: Path, mapper: Optional[pd.DataFr
         m["Type"] = m["Type"].astype(str).map(_canonical_type)
         available_types = sorted(m["Type"].dropna().unique().tolist())
 
-        codes_by_type = {}
         for t, g in m.groupby("Type"):
             codes = set(g["Code"].dropna().astype(str).str.strip().tolist())
-            # Always merge rep codes for that canonical Type
             codes |= rep_codes.get(t, set())
             if codes:
                 codes_by_type[t] = codes
@@ -272,23 +277,29 @@ def _scan_local_availability(country_data_root: Path, mapper: Optional[pd.DataFr
         available_types = sorted(codes_by_type.keys())
 
     suff = _suffixes_for_freq()
-    if not country_data_root.exists():
+    isos = _list_available_isos()
+    if not isos:
         return type_to_isos, available_types
 
-    for cdir in [p for p in country_data_root.iterdir() if p.is_dir() and len(p.name) == 3]:
-        iso3 = cdir.name.upper()
+    for iso3 in isos:
         for typ, codes in codes_by_type.items():
             found_for_type = False
             for freq, sfx_list in suff.items():
-                f = country_data_root / iso3 / freq / f"{iso3}_ADM0_data.parquet"
-                if not f.exists():
-                    continue
-                try:
-                    cols = list(pd.read_parquet(f, columns=None).columns)
-                except Exception as e:
-                    _note_err(f"Failed reading {f}: {e}")
-                    continue
-                if _any_column_for_type(cols, codes, sfx_list):
+                # try local file first
+                lf = _adm0_file_local(iso3, freq)
+                cols = None
+                if lf.exists():
+                    try:
+                        cols = list(pd.read_parquet(lf, columns=None).columns)
+                    except Exception as e:
+                        _note_err(f"Failed reading {lf}: {e}")
+                        cols = None
+                if cols is None:
+                    # try HF
+                    rel = _adm0_relpath(iso3, freq)
+                    d = _hf_read_parquet(rel, columns=None)
+                    cols = list(d.columns) if d is not None else None
+                if cols and _any_column_for_type(cols, codes, sfx_list):
                     found_for_type = True
                     break
             if found_for_type:
@@ -324,11 +335,74 @@ st.markdown("<h1 style='text-align:center'>Global Database of Subnational Climat
 st.markdown("<div class='subtitle'>Built and Maintained by Roshen Fernando and Patrick Jaime Simba</div>", unsafe_allow_html=True)
 st.divider()
 
+# === Global series builders (kept; add HF fallback) ===
+def _monthly_adm0_path(iso3: str) -> Path:
+    return COUNTRY_DATA_ROOT / iso3 / "Monthly" / f"{iso3}_ADM0_data.parquet"
+
+def _read_monthly_adm0_series(iso3: str, code: str) -> Optional[pd.DataFrame]:
+    """Read iso3 ADM0 Monthly series for a given code (prefer _AM, fall back to _PM/_M)."""
+    f = _monthly_adm0_path(iso3)
+    df = None
+    if f.exists():
+        try:
+            cols = list(pd.read_parquet(f, columns=None).columns)
+            df_src = ("local", f)
+        except Exception as e:
+            _note_err(f"Schema read failed for {f}: {e}")
+            cols = None
+    else:
+        cols = None
+
+    if cols is None:
+        # try HF
+        rel = _adm0_relpath(iso3, "Monthly")
+        d = _hf_read_parquet(rel, columns=None)
+        if d is None:
+            return None
+        cols = list(d.columns)
+        df = d
+        df_src = ("hf", rel)
+
+    # choose column
+    target = None
+    for sfx in ("_AM","_PM","_M"):
+        cand = f"{code}{sfx}"
+        if cand in cols:
+            target = cand; break
+    if not target:
+        return None
+
+    if df is None:
+        # read local with needed columns
+        try:
+            use_cols = [c for c in ("Year","Month", target) if c in cols]
+            df = pd.read_parquet(f, columns=use_cols).rename(columns={target:"value"})
+        except Exception as e:
+            _note_err(f"Data read failed for {f}: {e}")
+            return None
+    else:
+        # df already from HF; subset/rename
+        use_cols = [c for c in ("Year","Month", target) if c in df.columns]
+        df = df[use_cols].rename(columns={target:"value"})
+
+    if "Year" not in df.columns or "Month" not in df.columns:
+        return None
+
+    df["Year"]  = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
+    df["Month"] = pd.to_numeric(df["Month"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["Year","Month","value"])
+    if df.empty: return None
+    df["Date"] = pd.to_datetime(df["Year"].astype(int).astype(str) + "-" + df["Month"].astype(int).astype(str).str.zfill(2) + "-01", errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df["iso3"] = iso3
+    return df[["iso3","Date","value"]].sort_values("Date").reset_index(drop=True)
+
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _build_global_series_for_code(code: str) -> Optional[pd.DataFrame]:
     rows = []
-    for cdir in _country_dirs(COUNTRY_DATA_ROOT):
-        iso3 = cdir.name.upper()
+    # iterate isos from local or HF
+    isos = _list_available_isos()
+    for iso3 in isos:
         d = _read_monthly_adm0_series(iso3, code)
         if d is not None and not d.empty:
             rows.append(d)
@@ -359,73 +433,12 @@ for df in (g_temp, g_prec, g_hum, g_wspd):
     if df is not None and not df.empty:
         latest_candidates.append(pd.to_datetime(df["Date"]).max())
 
-# --- Data through (works for local or HF) ---
-def _latest_date_from_adm0(iso: str, freq: str, code_candidates=("TMPA","PCPA","HUMA","WSPA")) -> pd.Timestamp | None:
-    p = _adm0_fp(iso, freq)
-    try:
-        df = read_parquet_smart(p)  # <-- backend aware
-    except Exception:
-        return None
-    # find any available main-indicator column for this freq
-    def _suffixes(level: str, freq: str):
-        return (["_AM","_PM"] if freq=="Monthly" else ["_AS","_PS"] if freq=="Seasonal" else ["_A"]) if level=="ADM0" else (["_M"] if freq=="Monthly" else ["_S"] if freq=="Seasonal" else ["_A"])
-    def _pick_col(cols, code, sfxs):
-        low = {c.lower(): c for c in cols}
-        for s in sfxs:
-            k=f"{code}{s}".lower()
-            if k in low: return low[k]
-        return None
-    col=None
-    for code in code_candidates:
-        col = _pick_col(list(df.columns), code, _suffixes("ADM0", freq))
-        if col: break
-    if not col: return None
-    df2 = df.copy()
-    df2["Date"] = _to_date_from_parts(df2, freq)
-    df2 = df2.dropna(subset=["Date"])
-    return None if df2.empty else df2["Date"].max()
-
-def compute_data_through() -> str:
-    # scan all ISO folders under country_data (or HF)
-    # try Monthly first, then Seasonal, then Annual
-    latest_candidates=[]
-    # list ISOs (local or HF)
-    isos = []
-    if DATA_BACKEND in ("hf","auto") and list_repo_files is not None:
-        try:
-            files = list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, token=HF_TOKEN)
-            for f in files:
-                parts=f.split("/")
-                if len(parts)>=4 and parts[0]=="country_data" and len(parts[1])==3:
-                    isos.append(parts[1].upper())
-            isos = sorted(set(isos))
-        except Exception:
-            pass
-    if not isos:
-        if COUNTRY_DATA_DIR.exists():
-            isos = sorted([p.name.upper() for p in COUNTRY_DATA_DIR.iterdir() if p.is_dir() and len(p.name)==3])
-
-    for iso in isos:
-        for freq in ("Monthly","Seasonal","Annual"):
-            dt = _latest_date_from_adm0(iso, freq)
-            if dt is not None:
-                latest_candidates.append(dt)
-
-    if not latest_candidates:
-        return "—"
-    mx = max(latest_candidates)
-    # render as YYYY-MM for Monthly/Seasonal anchor dates; YYYY if it's a 07-01 annual anchor
-    return mx.strftime("%Y") if (mx.month==7 and mx.day==1) else mx.strftime("%Y-%m")
-
-data_through = compute_data_through()
-
 def _fmt_badge_dt(x):
     ts = pd.to_datetime(x, errors="coerce")
-    return ts.strftime("%b %Y") if (ts is not pd.NaT and pd.notna(ts)) else "—"
+    return ts.strftime("%b %Y") if pd.notna(ts) else "—"
 
-badge_dt = data_through or "—"
-
-
+data_through = max(latest_candidates) if latest_candidates else None
+badge_dt = _fmt_badge_dt(data_through)
 
 # ===== HERO (unchanged) =====
 left, right = st.columns([0.62, 0.38], gap="large")
@@ -506,13 +519,16 @@ def _perform_nav_if_pending():
 _perform_nav_if_pending()
 
 # ---------- Countries master ----------
+isos_avail = _list_available_isos()
 if pycountry:
     all_countries = pd.DataFrame([{"iso3": c.alpha_3, "name": c.name} for c in pycountry.countries if hasattr(c, "alpha_3")])
+    if isos_avail:
+        all_countries = all_countries[all_countries["iso3"].isin(isos_avail)]
 else:
-    all_countries = pd.DataFrame({"iso3": sorted(list(iso_with_data))}); all_countries["name"] = all_countries["iso3"]
+    all_countries = pd.DataFrame({"iso3": isos_avail}); all_countries["name"] = all_countries["iso3"]
 
 all_countries["iso3"] = all_countries["iso3"].astype(str).str.upper().str.strip()
-_name_overrides = {"CHN": "People's Republic of China", "TWN": "Taipe, China", "HKG": "Hong Kong, China"}
+_name_overrides = {"CHN": "People's Republic of China", "TWN": "Taipei, China", "HKG": "Hong Kong, China"}
 all_countries["name"] = all_countries.apply(lambda r: _name_overrides.get(r["iso3"], r.get("name", r["iso3"])), axis=1)
 
 for t in AVAILABLE_INDICATORS:
@@ -646,11 +662,19 @@ if st.query_params.get("debug", ["0"])[0] == "1":
     test_iso = "AFG"
     rows = []
     for freq, sfx_list in _suffixes_for_freq().items():
-        f = COUNTRY_DATA_ROOT / test_iso / freq / f"{test_iso}_ADM0_data.parquet"
+        f = _adm0_file_local(test_iso, freq)
         exists = f.exists()
         matched_types = []
-        if exists and INDICATOR_MAPPER is not None and not INDICATOR_MAPPER.empty:
-            # Build codes_by_type like the scanner
+        cols = []
+        if exists:
+            try:
+                cols = list(pd.read_parquet(f, columns=None).columns)
+            except Exception as e:
+                cols = [f"(local read error: {e})"]
+        else:
+            d = _hf_read_parquet(_adm0_relpath(test_iso, freq), columns=None)
+            cols = list(d.columns) if d is not None else []
+        if cols and INDICATOR_MAPPER is not None and not INDICATOR_MAPPER.empty:
             cb = {}
             m = INDICATOR_MAPPER.copy()
             m["Code"] = m["Code"].astype(str).str.strip()
@@ -660,14 +684,10 @@ if st.query_params.get("debug", ["0"])[0] == "1":
                 if t in {"Temperature","Humidity","Precipitation","Wind","Wind speed","Wind speeds"}:
                     codes |= {"TMPA","HUMA","PCPA","WSPA"} if t!="Temperature" else {"TMPA"}
                 if codes: cb[t] = codes
-            try:
-                cols = list(pd.read_parquet(f, columns=None).columns) if exists else []
-                for t, codes in cb.items():
-                    if _any_column_for_type(cols, codes, sfx_list):
-                        matched_types.append(t)
-            except Exception as e:
-                matched_types = [f"err: {e}"]
-        rows.append({"freq": freq, "exists": exists, "matched_types": ", ".join(sorted(set(matched_types)))})
+            for t, codes in cb.items():
+                if _any_column_for_type(cols, codes, sfx_list):
+                    matched_types.append(t)
+        rows.append({"freq": freq, "local_exists": exists, "matched_types": ", ".join(sorted(set(matched_types)))})
     st.dataframe(pd.DataFrame(rows))
 
 
@@ -677,72 +697,7 @@ if st.query_params.get("debug", ["0"])[0] == "1":
 st.divider()
 st.subheader("Global snapshot (beta)")
 
-# Representative codes per Type (fixed as requested)
-REP_CODES = {
-    "Temperature": "TMPA",
-    "Precipitation": "PCPA",
-    "Humidity": "HUMA",
-    "Wind speeds": "WSPA",
-}
-
-def _monthly_adm0_path(iso3: str) -> Path:
-    return COUNTRY_DATA_ROOT / iso3 / "Monthly" / f"{iso3}_ADM0_data.parquet"
-
-def _read_monthly_adm0_series(iso3: str, code: str) -> Optional[pd.DataFrame]:
-    """Read iso3 ADM0 Monthly series for a given code (prefer _AM, fall back to _PM)."""
-    f = _monthly_adm0_path(iso3)
-    if not f.exists(): return None
-    try:
-        cols = list(pd.read_parquet(f, columns=None).columns)
-    except Exception as e:
-        _note_err(f"Schema read failed for {f}: {e}")
-        return None
-    target = None
-    for sfx in ("_AM","_PM"):
-        cand = f"{code}{sfx}"
-        if cand in cols:
-            target = cand; break
-    if not target: return None
-    try:
-        use_cols = [c for c in ("Year","Month", target) if c in cols]
-        df = pd.read_parquet(f, columns=use_cols).rename(columns={target:"value"})
-    except Exception as e:
-        _note_err(f"Data read failed for {f}: {e}")
-        return None
-    if "Year" not in df.columns or "Month" not in df.columns: return None
-    df["Year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
-    df["Month"] = pd.to_numeric(df["Month"], errors="coerce").astype("Int64")
-    df = df.dropna(subset=["Year","Month","value"])
-    if df.empty: return None
-    df["Date"] = pd.to_datetime(df["Year"].astype(int).astype(str) + "-" + df["Month"].astype(int).astype(str).str.zfill(2) + "-01", errors="coerce")
-    df = df.dropna(subset=["Date"])
-    df["iso3"] = iso3
-    return df[["iso3","Date","value"]].sort_values("Date").reset_index(drop=True)
-
-@st.cache_data(ttl=24*3600, show_spinner=False)
-def _build_global_series_for_code(code: str) -> Optional[pd.DataFrame]:
-    rows = []
-    for cdir in _country_dirs(COUNTRY_DATA_ROOT):
-        iso3 = cdir.name.upper()
-        d = _read_monthly_adm0_series(iso3, code)
-        if d is not None and not d.empty:
-            rows.append(d)
-    if not rows:
-        return None
-    out = pd.concat(rows, ignore_index=True)
-    # Rough sanity windows for plotting
-    if code == "TMPA":
-        out = out[(out["value"] > -80) & (out["value"] < 60)]
-    if code == "PCPA":
-        out = out[(out["value"] >= 0) & (out["value"] < 2000)]
-    return out
-
-# Build all four series for snapshot
-g_temp = _build_global_series_for_code(REP_CODES["Temperature"])
-g_prec = _build_global_series_for_code(REP_CODES["Precipitation"])
-g_hum  = _build_global_series_for_code(REP_CODES["Humidity"])
-g_wspd = _build_global_series_for_code(REP_CODES["Wind speeds"])
-
+# Build all four series for snapshot (already built above)
 def _coverage_over_time(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     if df is None or df.empty: return None
     d = df[["iso3","Date"]].copy()
@@ -775,13 +730,9 @@ else:
 # Update "Data through" (latest of all four)
 latest_candidates = []
 for df in (g_temp, g_prec, g_hum, g_wspd):
-    if df is not None and not df.empty and "Date" in df.columns:
-        latest_candidates.append(pd.to_datetime(df["Date"], errors="coerce").max())
-
-# drop NaT entries before taking max
-latest_candidates = [d for d in latest_candidates if pd.notna(d)]
+    if df is not None and not df.empty:
+        latest_candidates.append(df["Date"].max())
 data_through = max(latest_candidates) if latest_candidates else None
-
 
 # Latest datapoint histograms (two rows)
 def _latest_by_country(df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
