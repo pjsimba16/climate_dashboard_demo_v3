@@ -36,6 +36,23 @@ except Exception:
 HF_REPO_ID   = "pjsimba16/adb-climate-data"  # <— your Space
 HF_REPO_PREF = ("space", "dataset")          # try Space first; then dataset fallback
 
+def _get_hf_token():
+    # Return None (not empty string) when no token present
+    try:
+        if hasattr(st, "secrets"):
+            tok = st.secrets.get("HF_TOKEN")
+            if tok is not None:
+                tok = str(tok).strip()
+                return tok or None
+    except Exception:
+        pass
+    env = os.getenv("HF_TOKEN", None)
+    if env is None:
+        return None
+    env = str(env).strip()
+    return env or None
+
+
 # ==== DEBUG PANEL (toggle by ?debug=1) ====
 def _note_err(msg: str):
     st.session_state.setdefault("hf_errors", []).append(str(msg))
