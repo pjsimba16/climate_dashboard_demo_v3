@@ -129,18 +129,33 @@ if debug_on:
         else:
             st.info("No HF errors recorded yet.")
 
-
-
-
-def _get_hf_token() -> str:
+def _get_hf_token():
     try:
         if hasattr(st, "secrets"):
             tok = st.secrets.get("HF_TOKEN")
-            if tok:
-                return str(tok)
+            if tok is not None:
+                tok = str(tok).strip()
+                return tok or None   # <- return None if empty
     except Exception:
         pass
-    return os.getenv("HF_TOKEN", "")
+    env = os.getenv("HF_TOKEN", None)
+    if env is None:
+        return None
+    env = str(env).strip()
+    return env or None               # <- return None if empty
+
+def _hf_call_download(repo_id: str, repo_type: str, filename: str, token: str | None):
+    kwargs = dict(repo_id=repo_id, repo_type=repo_type, filename=filename)
+    if token:  # only include token if non-empty
+        kwargs["token"] = token
+    return hf_hub_download(**kwargs)
+
+def _hf_call_list(repo_id: str, repo_type: str, token: str | None):
+    kwargs = dict(repo_id=repo_id, repo_type=repo_type)
+    if token:
+        kwargs["token"] = token
+    return list_repo_files(**kwargs)
+
 
 def _hf_download(relpath: str) -> Optional[str]:
     """
