@@ -26,6 +26,110 @@ try:
 except Exception:
     pycountry = None
 
+# === Data backend selector (local | hf | auto) ===
+import os
+from pathlib import Path
+try:
+    from huggingface_hub import hf_hub_download, list_repo_files
+except Exception:
+    hf_hub_download = None
+    list_repo_files = None
+
+def _secret_or_env(k, default=""):
+    try:
+        if hasattr(st, "secrets") and k in st.secrets:
+            return st.secrets[k]
+    except Exception:
+        pass
+    return os.getenv(k, default)
+
+DATA_BACKEND_OVERRIDE = os.getenv("DATA_BACKEND", "auto")  # "local" | "hf" | "auto"
+HF_REPO_ID   = _secret_or_env("HF_REPO_ID",   "pjsimba16/adb_climate_dashboard_v1")
+HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE", "space")      # "space" or "dataset"
+HF_TOKEN     = _secret_or_env("HF_TOKEN",     "")
+
+def _resolve_backend() -> str:
+    # allow ?backend=hf in URL, or st.secrets["DATA_BACKEND"], or env var
+    qp = {}
+    try:
+        qp = st.query_params
+    except Exception:
+        pass
+    if qp:
+        b = str(qp.get("backend", [""])[0]).lower()
+        if b in ("local","hf","auto"): return b
+    if hasattr(st, "secrets"):
+        v = str(st.secrets.get("DATA_BACKEND","auto")).lower()
+        if v in ("local","hf","auto"): return v
+    ov = str(DATA_BACKEND_OVERRIDE or "auto").lower()
+    return ov if ov in ("local","hf","auto") else "auto"
+
+DATA_BACKEND = _resolve_backend()
+ROOT = Path(__file__).resolve().parents[1]  # project root (…/app)
+COUNTRY_DATA_DIR = next((p for p in [
+    ROOT / "country_data",
+    Path.cwd() / "country_data",
+    Path("/mnt/data/country_data"),
+] if p.exists()), ROOT / "country_data")
+
+def _rel_from_country_data(p: Path) -> str:
+    # convert local file path to "country_data/ISO/Freq/…parquet"
+    try:
+        return "country_data/" + str(p.relative_to(COUNTRY_DATA_DIR)).replace("\\","/")
+    except Exception:
+        return None
+
+def _read_parquet_local(p: Path, columns=None):
+    return pd.read_parquet(p, columns=columns)  # let it raise if missing
+
+def _read_parquet_hf(relpath: str, columns=None):
+    if hf_hub_download is None:
+        raise FileNotFoundError("huggingface_hub not available.")
+    fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
+                         filename=relpath, token=HF_TOKEN)
+    return pd.read_parquet(fp, columns=columns)
+
+def read_parquet_smart(p: Path, columns=None):
+    """
+    Tries local first (if backend=local or auto+exists). Otherwise loads from HF.
+    'p' must be a path under COUNTRY_DATA_DIR.
+    """
+    use = DATA_BACKEND
+    if use in ("local","auto") and p.exists():
+        return _read_parquet_local(p, columns=columns)
+    rel = _rel_from_country_data(p)
+    if use in ("hf","auto") and rel:
+        return _read_parquet_hf(rel, columns=columns)
+    # last attempt: local (to surface the original error)
+    return _read_parquet_local(p, columns=columns)
+
+def _adm0_fp(iso: str, freq: str) -> Path:
+    folder = {"Monthly":"Monthly","Seasonal":"Seasonal","Annual":"Annual"}[freq]
+    return COUNTRY_DATA_DIR / iso.upper() / folder / f"{iso.upper()}_ADM0_data.parquet"
+
+def _to_date_from_parts(df: pd.DataFrame, freq: str) -> pd.Series:
+    if freq == "Monthly":
+        y = pd.to_numeric(df["Year"], errors="coerce")
+        m = pd.to_numeric(df["Month"], errors="coerce")
+        return pd.to_datetime(dict(year=y, month=m, day=1), errors="coerce")
+    if freq == "Seasonal":
+        # accept Season like "DJF","MAM","JJA","SON" or "Q1" etc.
+        s = df["Season"].astype(str)
+        # try quarter first
+        q = s.str.extract(r"Q([1-4])", expand=False).astype(float)
+        if q.notna().any():
+            month = q.map({1:1,2:4,3:7,4:10})
+            y = pd.to_numeric(df.get("Year"), errors="coerce")
+            return pd.to_datetime(dict(year=y, month=month, day=1), errors="coerce")
+        # fallback DJF/MAM/JJA/SON
+        SEASON_TO_MONTH = {"DJF": 2, "MAM": 5, "JJA": 8, "SON": 11}
+        y = pd.to_numeric(df.get("Year"), errors="coerce")
+        anchor = s.str.upper().map(SEASON_TO_MONTH).fillna(2).astype(int)
+        return pd.to_datetime(dict(year=y, month=anchor, day=1), errors="coerce")
+    y = pd.to_numeric(df["Year"], errors="coerce")
+    return pd.to_datetime(dict(year=y, month=7, day=1), errors="coerce")
+
+
 st.set_page_config(
     page_title="Home Page — Global Database of Subnational Climate Indicators",
     layout="wide",
@@ -220,6 +324,103 @@ st.markdown("<h1 style='text-align:center'>Global Database of Subnational Climat
 st.markdown("<div class='subtitle'>Built and Maintained by Roshen Fernando and Patrick Jaime Simba</div>", unsafe_allow_html=True)
 st.divider()
 
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def _build_global_series_for_code(code: str) -> Optional[pd.DataFrame]:
+    rows = []
+    for cdir in _country_dirs(COUNTRY_DATA_ROOT):
+        iso3 = cdir.name.upper()
+        d = _read_monthly_adm0_series(iso3, code)
+        if d is not None and not d.empty:
+            rows.append(d)
+    if not rows:
+        return None
+    out = pd.concat(rows, ignore_index=True)
+    # Rough sanity windows for plotting
+    if code == "TMPA":
+        out = out[(out["value"] > -80) & (out["value"] < 60)]
+    if code == "PCPA":
+        out = out[(out["value"] >= 0) & (out["value"] < 2000)]
+    return out
+
+REP_CODES = {
+    "Temperature": "TMPA",
+    "Precipitation": "PCPA",
+    "Humidity": "HUMA",
+    "Wind speeds": "WSPA",
+}
+# --- build the four snapshot series FIRST (place this ABOVE the hero) ---
+g_temp = _build_global_series_for_code(REP_CODES["Temperature"])
+g_prec = _build_global_series_for_code(REP_CODES["Precipitation"])
+g_hum  = _build_global_series_for_code(REP_CODES["Humidity"])
+g_wspd = _build_global_series_for_code(REP_CODES["Wind speeds"])
+
+latest_candidates = []
+for df in (g_temp, g_prec, g_hum, g_wspd):
+    if df is not None and not df.empty:
+        latest_candidates.append(pd.to_datetime(df["Date"]).max())
+
+# --- Data through (works for local or HF) ---
+def _latest_date_from_adm0(iso: str, freq: str, code_candidates=("TMPA","PCPA","HUMA","WSPA")) -> pd.Timestamp | None:
+    p = _adm0_fp(iso, freq)
+    try:
+        df = read_parquet_smart(p)  # <-- backend aware
+    except Exception:
+        return None
+    # find any available main-indicator column for this freq
+    def _suffixes(level: str, freq: str):
+        return (["_AM","_PM"] if freq=="Monthly" else ["_AS","_PS"] if freq=="Seasonal" else ["_A"]) if level=="ADM0" else (["_M"] if freq=="Monthly" else ["_S"] if freq=="Seasonal" else ["_A"])
+    def _pick_col(cols, code, sfxs):
+        low = {c.lower(): c for c in cols}
+        for s in sfxs:
+            k=f"{code}{s}".lower()
+            if k in low: return low[k]
+        return None
+    col=None
+    for code in code_candidates:
+        col = _pick_col(list(df.columns), code, _suffixes("ADM0", freq))
+        if col: break
+    if not col: return None
+    df2 = df.copy()
+    df2["Date"] = _to_date_from_parts(df2, freq)
+    df2 = df2.dropna(subset=["Date"])
+    return None if df2.empty else df2["Date"].max()
+
+def compute_data_through() -> str:
+    # scan all ISO folders under country_data (or HF)
+    # try Monthly first, then Seasonal, then Annual
+    latest_candidates=[]
+    # list ISOs (local or HF)
+    isos = []
+    if DATA_BACKEND in ("hf","auto") and list_repo_files is not None:
+        try:
+            files = list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE, token=HF_TOKEN)
+            for f in files:
+                parts=f.split("/")
+                if len(parts)>=4 and parts[0]=="country_data" and len(parts[1])==3:
+                    isos.append(parts[1].upper())
+            isos = sorted(set(isos))
+        except Exception:
+            pass
+    if not isos:
+        if COUNTRY_DATA_DIR.exists():
+            isos = sorted([p.name.upper() for p in COUNTRY_DATA_DIR.iterdir() if p.is_dir() and len(p.name)==3])
+
+    for iso in isos:
+        for freq in ("Monthly","Seasonal","Annual"):
+            dt = _latest_date_from_adm0(iso, freq)
+            if dt is not None:
+                latest_candidates.append(dt)
+
+    if not latest_candidates:
+        return "—"
+    mx = max(latest_candidates)
+    # render as YYYY-MM for Monthly/Seasonal anchor dates; YYYY if it's a 07-01 annual anchor
+    return mx.strftime("%Y") if (mx.month==7 and mx.day==1) else mx.strftime("%Y-%m")
+
+data_through = compute_data_through()
+
+badge_dt = (pd.to_datetime(data_through).strftime("%b %Y") if data_through is not None else "—")
+
 # ===== HERO (unchanged) =====
 left, right = st.columns([0.62, 0.38], gap="large")
 with left:
@@ -229,11 +430,11 @@ with left:
           <h2>🌍 Explore subnational climate indicators worldwide</h2>
           <p>Click a country on the map to open its dashboard, or use Quick search to jump directly.</p>
           <div class="badgerow">
-            <span class="badge">Data through: <b>{{DATA_THROUGH}}</b></span>
+            <span class="badge">Data through: <b>{badge_dt}</b></span>
             <span class="badge" style="margin-left:6px;">Last Update: <b>{_now_label()}</b></span>
           </div>
         </div>
-        """.replace("{DATA_THROUGH}", "—"),
+        """,
         unsafe_allow_html=True
     )
 with right:
