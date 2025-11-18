@@ -82,7 +82,7 @@ def _secret_or_env(k, default=""):
     except Exception: pass
     return os.getenv(k, default)
 
-HF_REPO_ID   = _secret_or_env("HF_REPO_ID","pjsimba16/adb_climate_dashboard_v1")
+HF_REPO_ID   = _secret_or_env("HF_REPO_ID","pjsimba16/adb-climate-data")
 HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE","space")  # space per your note
 HF_TOKEN     = _secret_or_env("HF_TOKEN","") or None
 
@@ -880,3 +880,4 @@ try:
                        file_name="custom_chart.png", mime="image/png")
 except Exception:
     pass
+
