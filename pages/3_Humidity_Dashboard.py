@@ -32,7 +32,7 @@ def _secret_or_env(k, default=""):
     return os.getenv(k, default)
 
 DATA_BACKEND_OVERRIDE = os.getenv("DATA_BACKEND", "auto")  # "local" | "hf" | "auto"
-HF_REPO_ID   = _secret_or_env("HF_REPO_ID",   "pjsimba16/adb_climate_dashboard_v1")
+HF_REPO_ID   = _secret_or_env("HF_REPO_ID",   "pjsimba16/adb-climate-data")
 HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE", "space")      # "space" or "dataset"
 HF_TOKEN     = _secret_or_env("HF_TOKEN",     "")
 
@@ -1082,3 +1082,4 @@ for _title, _code, _key in [
     ("Minimum Relative Humidity — Percentiles", "HUMN", "pct_humn"),
 ]:
     _pct_block(_title, _code, _key, _pct_story)
+
