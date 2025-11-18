@@ -36,6 +36,100 @@ except Exception:
 HF_REPO_ID   = "pjsimba16/adb-climate-data"  # <— your Space
 HF_REPO_PREF = ("space", "dataset")          # try Space first; then dataset fallback
 
+# ==== DEBUG PANEL (toggle by ?debug=1) ====
+debug_on = str(st.query_params.get("debug", ["0"])[0]).lower() in {"1","true","yes"}
+
+if debug_on:
+    with st.expander("🔎 Hugging Face data debug", expanded=True):
+        # 0) Show repo settings
+        try:
+            from huggingface_hub import list_repo_files, hf_hub_download
+            st.write("✅ huggingface_hub is installed")
+        except Exception as e:
+            st.error(f"❌ huggingface_hub not available: {e}")
+
+        HF_REPO_ID = "pjsimba16/adb-climate-data"  # make sure this matches your Space
+        HF_TOKEN = st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN", ""))
+        st.write({"HF_REPO_ID": HF_REPO_ID, "has_token": bool(HF_TOKEN)})
+
+        # 1) List some files to confirm the repo is reachable
+        files = []
+        try:
+            files = list_repo_files(repo_id=HF_REPO_ID, repo_type="space", token=HF_TOKEN)
+        except Exception as e:
+            _note_err(f"list_repo_files(space) failed: {e}")
+            try:
+                files = list_repo_files(repo_id=HF_REPO_ID, repo_type="dataset", token=HF_TOKEN)
+                st.info("Used repo_type=dataset fallback.")
+            except Exception as e2:
+                _note_err(f"list_repo_files(dataset) failed too: {e2}")
+        st.write(f"File count: {len(files)}")
+        # Show a few country_data paths if any
+        sample_cd = [f for f in files if f.startswith("country_data/")][:10]
+        st.write("Sample country_data paths:", sample_cd)
+
+        # 2) Pick an ISO to probe (PHL/USA/AFG exist in your data). Adjust if needed.
+        probe_iso = st.text_input("Probe ISO3", value="PHL").upper().strip()
+        probe_freq = st.selectbox("Probe frequency", ["Monthly", "Seasonal", "Annual"], index=0)
+
+        # 3) Try to download one ADM0 file and read it
+        folder = {"Monthly":"Monthly","Seasonal":"Seasonal","Annual":"Annual"}[probe_freq]
+        relpath = f"country_data/{probe_iso}/{folder}/{probe_iso}_ADM0_data.parquet"
+        st.write("Trying to read:", relpath)
+
+        df_adm0 = None
+        try:
+            local_fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type="space", filename=relpath, token=HF_TOKEN)
+        except Exception as e:
+            _note_err(f"hf_hub_download(space) failed for {relpath}: {e}")
+            try:
+                local_fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type="dataset", filename=relpath, token=HF_TOKEN)
+                st.info("Used repo_type=dataset fallback.")
+            except Exception as e2:
+                local_fp = None
+                _note_err(f"hf_hub_download(dataset) failed for {relpath}: {e2}")
+
+        if local_fp:
+            try:
+                df_adm0 = pd.read_parquet(local_fp)
+                st.success(f"Read OK: {relpath}")
+                st.write("Columns (first 40):", list(df_adm0.columns)[:40])
+                st.write("Rows:", len(df_adm0))
+            except Exception as e:
+                _note_err(f"pd.read_parquet failed for {relpath}: {e}")
+                st.error(f"Could not read parquet: {e}")
+        else:
+            st.error("Could not download file from HF.")
+
+        # 4) Verify column suffixes exist for expected codes
+        if df_adm0 is not None:
+            def _has_any(base, freq, cols):
+                cols_low = {c.lower() for c in cols}
+                suf = {"Monthly":["_AM","_PM","_M"], "Seasonal":["_AS","_PS","_S"], "Annual":["_A"]}[freq]
+                for s in suf:
+                    if (base + s).lower() in cols_low:
+                        return True, base + s
+                return False, None
+
+            checks = {}
+            for code in ["TMPA","PCPA","HUMA","WSPA"]:
+                ok, found = _has_any(code, probe_freq, df_adm0.columns)
+                checks[code] = (ok, found)
+            st.write("Suffix checks (any column present?):", checks)
+
+        # 5) Show recent error log
+        errs = st.session_state.get("hf_errors", [])
+        if errs:
+            st.warning("Recent HF errors:")
+            for e in errs[-10:]:
+                st.code(e)
+        else:
+            st.info("No HF errors recorded yet.")
+
+
+def _note_err(msg: str):
+    st.session_state.setdefault("hf_errors", []).append(str(msg))
+
 def _get_hf_token() -> str:
     try:
         if hasattr(st, "secrets"):
@@ -519,6 +613,16 @@ def _perform_nav_if_pending():
 _perform_nav_if_pending()
 
 # ---------- Countries master ----------
+if debug_on:
+    try:
+        from huggingface_hub import list_repo_files
+        files = list_repo_files(repo_id=HF_REPO_ID, repo_type="space", token=st.secrets.get("HF_TOKEN", os.getenv("HF_TOKEN","")))
+    except Exception:
+        files = []
+    isos_seen = sorted({p.split("/")[1].upper() for p in files if p.startswith("country_data/") and len(p.split("/")) >= 3})
+    st.write("ISOs discovered on HF (country_data/*):", isos_seen[:30], f"...({len(isos_seen)} total)")
+
+
 isos_avail = _list_available_isos()
 if pycountry:
     all_countries = pd.DataFrame([{"iso3": c.alpha_3, "name": c.name} for c in pycountry.countries if hasattr(c, "alpha_3")])
