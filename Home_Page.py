@@ -82,11 +82,17 @@ if debug_on:
 
         df_adm0 = None
         try:
-            local_fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type="space", filename=relpath, token=HF_TOKEN)
+            #local_fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type="space", filename=relpath, token=HF_TOKEN)
+            tok = _get_hf_token()
+            local_fp = _hf_call_download(HF_REPO_ID, repo_type, relpath, tok)
+
         except Exception as e:
             _note_err(f"hf_hub_download(space) failed for {relpath}: {e}")
             try:
-                local_fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type="dataset", filename=relpath, token=HF_TOKEN)
+                #local_fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type="dataset", filename=relpath, token=HF_TOKEN)
+                tok = _get_hf_token()
+                local_fp = _hf_call_download(HF_REPO_ID, repo_type, relpath, tok)
+
                 st.info("Used repo_type=dataset fallback.")
             except Exception as e2:
                 local_fp = None
@@ -170,6 +176,7 @@ def _hf_download(relpath: str) -> Optional[str]:
         try:
             fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type=repo_type,
                                  filename=relpath, token=tok)
+            
             return fp
         except Exception as e:
             last_err = e
@@ -185,6 +192,7 @@ def _hf_list_country_isos() -> List[str]:
         return []
     try:
         files = list_repo_files(repo_id=HF_REPO_ID, repo_type=HF_REPO_PREF[0], token=_get_hf_token())
+
     except Exception:
         # fallback repo_type
         try:
