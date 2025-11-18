@@ -1,15 +1,12 @@
 # pages/4_Windspeeds_Dashboard.py
-# Windspeeds Dashboard — FULL mirror of Temperature/Humidity UI
-# - KPIs + arrows beside text (no duplicates), same spacing & sizes
-# - "Compare with other ADM1s..." (bold) + info dropdown + centered summary
-# - Map shows latest "Average Wind Speed" (auto-resolved) by ADM1 (or Elevation toggle)
-# - Charts:
-#     • Average Wind (AVG) + variance band (if available) with per-chart display form (0.2 / 0.7 / 0.1)
-#     • Maximum Wind (MAX) single line (no display options; 0.2 / 0.79 / 0.01)
-#     • Minimum Wind (MIN) single line (no display options; 0.2 / 0.79 / 0.01)
-#     • Percentiles radio [10..100] → separate charts for AVG, MAX, MIN (with ADM1 comparisons)
-# - Hover: one date header → per-ADM1 block; Seasonal shows "SEASON YYYY"
-# - Comparison summary under KPIs includes Outliers; values centered; no index
+# Windspeeds Dashboard — mirrors latest Temperature/Humidity UX/logic
+# - Country (all) focus; no top ADM1 selector
+# - KPIs → Comparison Summary (all ADM1s; searchable)
+# - Per-chart ADM1 multiselects (max 5) that only affect that chart
+# - WSPA has display options; WSPX/WSPN do not
+# - Percentiles: one percentile radio + one ADM1 multiselect for all three charts
+# - Legend horizontal; hover shows Date, then per-ADM1 blocks
+# - Map colors = latest WSPA per ADM1 at selected frequency (Elevation toggle available)
 
 import os, re, unicodedata
 from pathlib import Path
@@ -20,14 +17,101 @@ import plotly.express as px
 import plotly.graph_objects as go
 import geopandas as gpd
 
+# === Data backend selector (local | hf | auto) ===
+import os
+from pathlib import Path
 try:
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, list_repo_files
 except Exception:
     hf_hub_download = None
+    list_repo_files = None
+
+def _secret_or_env(k, default=""):
+    try:
+        if hasattr(st, "secrets") and k in st.secrets:
+            return st.secrets[k]
+    except Exception:
+        pass
+    return os.getenv(k, default)
+
+DATA_BACKEND_OVERRIDE = os.getenv("DATA_BACKEND", "auto")  # "local" | "hf" | "auto"
+HF_REPO_ID   = _secret_or_env("HF_REPO_ID",   "pjsimba16/adb_climate_dashboard_v1")
+HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE", "space")      # "space" or "dataset"
+HF_TOKEN     = _secret_or_env("HF_TOKEN",     "")
+
+def _resolve_backend() -> str:
+    # allow ?backend=hf in URL, or st.secrets["DATA_BACKEND"], or env var
+    qp = {}
+    try:
+        qp = st.query_params
+    except Exception:
+        pass
+    if qp:
+        b = str(qp.get("backend", [""])[0]).lower()
+        if b in ("local","hf","auto"): return b
+    if hasattr(st, "secrets"):
+        v = str(st.secrets.get("DATA_BACKEND","auto")).lower()
+        if v in ("local","hf","auto"): return v
+    ov = str(DATA_BACKEND_OVERRIDE or "auto").lower()
+    return ov if ov in ("local","hf","auto") else "auto"
+
+DATA_BACKEND = _resolve_backend()
+ROOT = Path(__file__).resolve().parents[1]  # project root (…/app)
+COUNTRY_DATA_DIR = next((p for p in [
+    ROOT / "country_data",
+    Path.cwd() / "country_data",
+    Path("/mnt/data/country_data"),
+] if p.exists()), ROOT / "country_data")
+
+def _rel_from_country_data(p: Path) -> str:
+    # convert local file path to "country_data/ISO/Freq/…parquet"
+    try:
+        return "country_data/" + str(p.relative_to(COUNTRY_DATA_DIR)).replace("\\","/")
+    except Exception:
+        return None
+
+def _read_parquet_local(p: Path, columns=None):
+    return pd.read_parquet(p, columns=columns)  # let it raise if missing
+
+def _read_parquet_hf(relpath: str, columns=None):
+    if hf_hub_download is None:
+        raise FileNotFoundError("huggingface_hub not available.")
+    fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
+                         filename=relpath, token=HF_TOKEN)
+    return pd.read_parquet(fp, columns=columns)
+
+def read_parquet_smart(p: Path, columns=None):
+    """
+    Tries local first (if backend=local or auto+exists). Otherwise loads from HF.
+    'p' must be a path under COUNTRY_DATA_DIR.
+    """
+    use = DATA_BACKEND
+    if use in ("local","auto") and p.exists():
+        return _read_parquet_local(p, columns=columns)
+    rel = _rel_from_country_data(p)
+    if use in ("hf","auto") and rel:
+        return _read_parquet_hf(rel, columns=columns)
+    # last attempt: local (to surface the original error)
+    return _read_parquet_local(p, columns=columns)
+
 
 st.set_page_config(page_title="Windspeeds Dashboard", layout="wide", initial_sidebar_state="collapsed")
 
-# ---------- CSS (match temperature/humidity pages) ----------
+# ===================== CONSTANTS =====================
+HF_REPO_ID = "pjsimba16/adb_climate_dashboard_v1"
+SEASON_TO_MONTH = {"DJF": 2, "MAM": 5, "JJA": 8, "SON": 11}
+MONTH_TO_SEASON = {12:"DJF",1:"DJF",2:"DJF",3:"MAM",4:"MAM",5:"MAM",6:"JJA",7:"JJA",8:"JJA",9:"SON",10:"SON",11:"SON"}
+
+INDICATOR_LABELS = (
+    "Windspeeds","Temperature","Precipitation","Temperature Thresholds","Heatwaves","Coldwaves",
+    "Dry Conditions","Wet Conditions","Humidity",
+)
+CBLIND = {
+    "blue":"#0072B2","orange":"#E69F00","sky":"#56B4E9","green":"#009E73",
+    "yellow":"#F0E442","navy":"#332288","verm":"#D55E00","pink":"#CC79A7","grey":"#999999","red":"#d62728"
+}
+
+# ---------- CSS (same KPI look as other pages) ----------
 st.markdown("""
 <style>
 div[data-testid="metric-container"] div[data-testid="stMetricValue"] { 
@@ -50,39 +134,22 @@ div[data-testid="metric-container"] > div:first-child {
 </style>
 """, unsafe_allow_html=True)
 
-# ===================== CONSTANTS =====================
-HF_REPO_ID = "pjsimba16/adb_climate_dashboard_v1"
-SEASON_TO_MONTH = {"DJF": 2, "MAM": 5, "JJA": 8, "SON": 11}
-MONTH_TO_SEASON = {12:"DJF",1:"DJF",2:"DJF",3:"MAM",4:"MAM",5:"MAM",6:"JJA",7:"JJA",8:"JJA",9:"SON",10:"SON",11:"SON"}
-INDICATOR_LABELS = (
-    "Windspeeds","Temperature","Precipitation","Temperature Thresholds","Heatwaves","Coldwaves",
-    "Dry Conditions","Wet Conditions","Humidity",
-)
-CBLIND = {
-    "blue":"#0072B2","orange":"#E69F00","sky":"#56B4E9","green":"#009E73",
-    "yellow":"#F0E442","navy":"#332288","verm":"#D55E00","pink":"#CC79A7","grey":"#999999","red":"#d62728"
-}
-
 # ===================== PATH HELPERS =====================
 def _here():
-    try:
-        return Path(__file__).parent.resolve()
-    except Exception:
-        return Path.cwd()
+    try: return Path(__file__).parent.resolve()
+    except Exception: return Path.cwd()
 
 def _probe_country_data_dir():
     here = _here()
     for p in [here / "country_data", here.parent / "country_data", Path.cwd() / "country_data", Path("/mnt/data/country_data")]:
-        if p.exists() and p.is_dir():
-            return p
+        if p.exists() and p.is_dir(): return p
     return here.parent / "country_data"
 
 def _probe_mapper_file():
     here = _here()
     for p in [here / "indicator_code_mapper.csv", here.parent / "indicator_code_mapper.csv",
               Path.cwd() / "indicator_code_mapper.csv", Path("/mnt/data/indicator_code_mapper.csv")]:
-        if p.exists() and p.is_file():
-            return p
+        if p.exists() and p.is_file(): return p
     return None
 
 COUNTRY_DATA_DIR = _probe_country_data_dir()
@@ -93,7 +160,7 @@ def _suffixes_for_freq(freq, adm_level):
     f = str(freq); adm = str(adm_level).upper()
     if adm == "ADM1":
         return ["_M"] if f=="Monthly" else (["_S"] if f=="Seasonal" else ["_A"])
-    return ["_AM","_PM"] if f=="Monthly" else (["_AS","_PS"] if f=="Seasonal" else ["_A"])
+    return ["_AM","_PM"] if f=="Monthly" else (["_AS","_PS"] if f=="Seasonal" else ["_AA"])
 
 def _pick_col(df_cols, base_code, suffixes):
     if not base_code: return None
@@ -129,14 +196,24 @@ def _format_hover_date(ts: pd.Timestamp, freq: str) -> str:
     if freq == "Seasonal": return f"{MONTH_TO_SEASON[int(ts.month)]} {ts.year}"
     return ts.strftime("%Y")
 
+def _season_labels_and_index(dates: pd.Series):
+    dates = pd.to_datetime(dates, errors="coerce").dropna().sort_values()
+    labels, seen, idx = [], set(), {}
+    for dt in dates:
+        lb = f"{MONTH_TO_SEASON[int(dt.month)]} {dt.year}"
+        if lb not in seen:
+            seen.add(lb)
+            labels.append(lb)
+            idx[lb] = pd.Timestamp(dt)
+    return labels, idx
+
+
 # ===================== INDICATOR MAPPER =====================
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def load_indicator_mapper():
     if not MAPPER_FILE: return pd.DataFrame()
-    try:
-        return pd.read_csv(MAPPER_FILE)
-    except Exception:
-        return pd.DataFrame()
+    try: return pd.read_csv(MAPPER_FILE)
+    except Exception: return pd.DataFrame()
 
 def _compose_title(code, mapper, fallback):
     if isinstance(mapper, pd.DataFrame) and not mapper.empty and {"Code","Description"}.issubset(mapper.columns):
@@ -145,45 +222,6 @@ def _compose_title(code, mapper, fallback):
             d = str(hit.iloc[0]["Description"])
             return d if d else fallback
     return fallback
-
-# Try to discover windspeeds codes from mapper by description keywords.
-def _find_code(mapper: pd.DataFrame, keywords: list[str]) -> str:
-    if mapper is None or mapper.empty: return None
-    m = mapper.copy()
-    m["desc"] = m["Description"].astype(str).str.lower()
-    mask = np.logical_and.reduce([m["desc"].str.contains(k.lower(), regex=False) for k in keywords])
-    hit = m.loc[mask]
-    if hit.empty:
-        # fallback: any that contains all words, loosen “wind speed” vs “windspeed”
-        alt_mask = np.logical_and.reduce([m["desc"].str.contains(k.lower().replace("windspeed","wind speed"), regex=False) for k in keywords])
-        hit = m.loc[alt_mask]
-    if hit.empty:
-        return None
-    return str(hit.iloc[0]["Code"]).strip()
-
-# You can override these once you know exact codes; otherwise we try mapper auto-detection.
-WINDSPEED_CODES = {
-    "AVG": 'WSPA',    # e.g., "WSA" or "WS10A" or "WSPA"
-    "VAR": 'WSPV',    # e.g., variance for AVG (if present)
-    "MAX": 'WSPX',    # e.g., "WSX"
-    "MIN": 'WSPN',    # e.g., "WSN"
-}
-
-def _resolve_ws_codes():
-    mp = load_indicator_mapper()
-    codes = WINDSPEED_CODES.copy()
-    if codes["AVG"] is None:
-        codes["AVG"] = _find_code(mp, ["average", "wind", "speed"]) or _find_code(mp, ["mean", "wind"])
-    if codes["VAR"] is None:
-        # try variance/standard deviation / variability for average wind
-        for kw in (["variance","wind"], ["std","wind"], ["variability","wind"]):
-            c = _find_code(mp, kw)
-            if c: codes["VAR"] = c; break
-    if codes["MAX"] is None:
-        codes["MAX"] = _find_code(mp, ["maximum", "wind", "speed"]) or _find_code(mp, ["max", "wind"])
-    if codes["MIN"] is None:
-        codes["MIN"] = _find_code(mp, ["minimum", "wind", "speed"]) or _find_code(mp, ["min", "wind"])
-    return codes
 
 # ===================== FILE RESOLVERS =====================
 def _adm0_file(iso3, freq):
@@ -230,7 +268,7 @@ def load_scope_series(iso3, freq, area_label, indicator_codes):
     if path is None:
         return pd.DataFrame(), {}
     try:
-        df_raw = pd.read_parquet(path)
+        df_raw = pd.read_parquet_smart(path)
     except Exception:
         return pd.DataFrame(), {}
     df = df_raw.copy()
@@ -239,26 +277,24 @@ def load_scope_series(iso3, freq, area_label, indicator_codes):
     out = pd.DataFrame({"date": df["date"]})
     pretty = {}
     for code in indicator_codes:
-        if not code: 
-            continue
         col = _pick_col(df.columns, code, suffixes)
         if col:
             out[code] = pd.to_numeric(df[col], errors="coerce")
             pretty[code] = _compose_title(code, mapper, code)
     return out.reset_index(drop=True), pretty
 
-def _prep_single(iso3_now, adm1_now, freq, code_avg, code_var=None):
-    codes = [c for c in [code_avg, code_var] if c]
-    area = adm1_now if (adm1_now and adm1_now != "Country (all)") else "Country (all)"
+def _prep_single(iso3_now, area_label, freq, code_avg, code_var=None):
+    codes = [code_avg] + ([code_var] if code_var else [])
+    area = "Country (all)" if (not area_label or area_label == "Country (all)") else area_label
     df_codes, _ = load_scope_series(iso3_now, freq, area, codes)
-    if df_codes.empty or (not code_avg) or code_avg not in df_codes:
+    if df_codes.empty or code_avg not in df_codes:
         return pd.DataFrame(columns=["date","avg","var"])
     out = pd.DataFrame({"date": df_codes["date"], "avg": pd.to_numeric(df_codes[code_avg], errors="coerce")})
     if code_var and code_var in df_codes:
         out["var"] = pd.to_numeric(df_codes[code_var], errors="coerce")
     return out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
-# ===================== GEO / MAP HELPERS =====================
+# ===================== GEOJSON (HF) =====================
 def _get_hf_token():
     try:
         if hasattr(st, "secrets"):
@@ -273,16 +309,14 @@ def load_country_adm1_geojson(iso3):
     if hf_hub_download is None:
         raise FileNotFoundError("huggingface_hub is not installed/available.")
     last_err = None
-    for repo_type in ("space", "dataset"):
+    for repo_type in ("space","dataset"):
         try:
             path = hf_hub_download(repo_id=HF_REPO_ID, repo_type=repo_type,
                                    filename=f"ADM1_geodata/{iso3}.geojson",
                                    token=_get_hf_token())
             gdf = gpd.read_file(path)
-            try:
-                gdf["geometry"] = gdf["geometry"].buffer(0)
-            except Exception:
-                pass
+            try: gdf["geometry"] = gdf["geometry"].buffer(0)
+            except Exception: pass
             gdf = gdf.to_crs(4326)
             bounds = tuple(gdf.total_bounds)
             name_col = "shapeName" if "shapeName" in gdf.columns else ("NAME_1" if "NAME_1" in gdf.columns else gdf.columns[0])
@@ -292,42 +326,46 @@ def load_country_adm1_geojson(iso3):
             continue
     raise last_err
 
+@st.cache_data(ttl=7*24*3600, show_spinner=False)
+def adm1_label_points(iso3):
+    _, _, name_col, gdf = load_country_adm1_geojson(iso3)
+    pts = gdf.representative_point()
+    return pts.x.to_numpy(), pts.y.to_numpy(), gdf[name_col].astype(str).to_numpy(), name_col
+
+# ===================== MAP DATA (latest WSPA) =====================
 @st.cache_data(ttl=900, show_spinner=False)
-def load_latest_adm1_for_map(iso3: str, freq: str, avg_code: str):
-    """Latest AVG wind per ADM1 for the selected frequency."""
+def load_latest_adm1_for_map(iso3, freq):
     def _scan_one(iso3_in, freq_in):
         base_dir = COUNTRY_DATA_DIR / str(iso3_in).upper() / {"Monthly":"Monthly","Seasonal":"Seasonal","Annual":"Annual"}[str(freq_in)]
         if not base_dir.exists():
             return pd.DataFrame(columns=["ADM1","value","Date"])
         suffixes = _suffixes_for_freq(freq_in, "ADM1")
-        rows = []
+        rows=[]
         for f in sorted(base_dir.glob("*_ADM1_data.parquet")):
             try:
-                cols = list(pd.read_parquet(f, columns=None).columns)
+                cols = list(pd.read_parquet_smart(f, columns=None).columns)
             except Exception:
                 continue
-            col = _pick_col(cols, avg_code, suffixes) if avg_code else None
-            if not col:
-                continue
+            col = _pick_col(cols, "WSPA", suffixes)
+            if not col: continue
             use_cols = ["ADM1","Year", col]
             if str(freq_in) == "Monthly": use_cols.append("Month")
             elif str(freq_in) == "Seasonal": use_cols.append("Season")
             try:
-                d = pd.read_parquet(f, columns=use_cols)
+                d = pd.read_parquet_smart(f, columns=use_cols)
             except Exception:
                 continue
-            d = d.rename(columns={col: "value"})
+            d = d.rename(columns={col:"value"})
             d["date"] = _build_date_column(d, freq_in)
             d = d.dropna(subset=["ADM1","date","value"])
             if d.empty: continue
             d = d.sort_values("date").tail(1).rename(columns={"date":"Date"})
             rows.append(d[["ADM1","value","Date"]])
-        if not rows:
-            return pd.DataFrame(columns=["ADM1","value","Date"])
+        if not rows: return pd.DataFrame(columns=["ADM1","value","Date"])
         return (pd.concat(rows, ignore_index=True)
                   .sort_values(["ADM1","Date"])
                   .drop_duplicates("ADM1", keep="last")
-                  .reset_index())
+                  .reset_index(drop=True))
     df = _scan_one(iso3, freq)
     if df.empty:
         for f in ["Monthly","Seasonal","Annual"]:
@@ -337,6 +375,53 @@ def load_latest_adm1_for_map(iso3: str, freq: str, avg_code: str):
                 dfi["__actual_freq_used__"] = f
                 return dfi
     return df
+
+# ===================== ELEVATION helper =====================
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def _load_city_map():
+    here = os.path.dirname(__file__)
+    candidates = [
+        os.path.normpath(os.path.join(here, "..", "city_mapper_with_coords_v3.csv")),
+        os.path.normpath(os.path.join(here, "..", "city_mapper_with_coords_v2.csv")),
+        os.path.join(here, "city_mapper_with_coords_v3.csv"),
+        os.path.join(here, "city_mapper_with_coords_v2.csv"),
+        "/mnt/data/city_mapper_with_coords_v3.csv",
+        "/mnt/data/city_mapper_with_coords_v2.csv",
+    ]
+    for fp in candidates:
+        try:
+            if os.path.isfile(fp):
+                df = pd.read_csv(fp)
+                cn_country = next((c for c in df.columns if c.lower()=="country"), None)
+                cn_city    = next((c for c in df.columns if c.lower()=="city"), None)
+                cn_elev    = next((c for c in df.columns if "elev" in c.lower()), None)
+                if not (cn_country and cn_city and cn_elev): continue
+                df = df.rename(columns={cn_country:"ADM0", cn_city:"ADM1", cn_elev:"elevation"})
+                df["ADM0"] = df["ADM0"].astype(str).str.upper().str.strip()
+                df["ADM1"] = df["ADM1"].astype(str).str.strip()
+                df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
+                return df[["ADM0","ADM1","elevation"]].copy()
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["ADM0","ADM1","elevation"])
+
+def _elevation_completeness(iso3, geojson_dict, city_map):
+    try:
+        feats = geojson_dict.get("features", [])
+        adm1_names = [f.get("properties",{}).get("shapeName") for f in feats]
+        adm1_names = [str(x) for x in adm1_names if x]
+    except Exception:
+        adm1_names = []
+    cm_iso = city_map[city_map["ADM0"].astype(str).str.upper() == str(iso3).upper()].copy()
+    if cm_iso.empty or not adm1_names:
+        return False, 0, len(adm1_names)
+    chk = pd.DataFrame({"ADM1": adm1_names})
+    tmp = cm_iso[["ADM1","elevation"]].copy()
+    tmp["elevation"] = pd.to_numeric(tmp["elevation"], errors="coerce")
+    chk = chk.merge(tmp, on="ADM1", how="left")
+    avail = int(chk["elevation"].notna().sum())
+    total = len(chk)
+    return (avail == total and total > 0), avail, total
 
 # ===================== HEADER / NAV =====================
 try:
@@ -362,22 +447,19 @@ def display_country_name(iso):
 
 qp = st.query_params
 iso3_q = (qp.get("iso3") or st.session_state.get("nav_iso3") or st.session_state.get("opt_iso3_w") or "").upper()
-city_q = qp.get("city","")
 
+# Header
 top_l, top_r = st.columns([0.12, 0.88])
 with top_l:
     if st.button("← Home", help="Back to Home"):
-        keep_iso3 = st.query_params.get("iso3",""); keep_city = st.query_params.get("city","")
+        keep_iso3 = st.query_params.get("iso3","")
         st.query_params.clear()
         if keep_iso3: st.query_params.update({"iso3": keep_iso3})
-        if keep_city: st.query_params.update({"city": keep_city})
-        try:
-            st.switch_page("Home_Page.py")
-        except Exception:
-            st.rerun()
+        try: st.switch_page("Home_Page.py")
+        except Exception: st.rerun()
 st.markdown(f"### Windspeeds - {display_country_name(iso3_q) if iso3_q else '…'}")
 
-# ===================== LAYOUT: LEFT MAP / RIGHT CONTROLS + KPI =====================
+# ===================== LEFT MAP / RIGHT CONTROLS =====================
 with st.spinner("Scanning available countries…"):
     countries_iso = list_available_isos()
 if iso3_q and iso3_q not in countries_iso:
@@ -400,18 +482,18 @@ with lc:
     )
     iso3_cur = "" if iso3 == "—" else iso3
     if iso3_cur != st.query_params.get("iso3",""):
-        st.query_params.update({"iso3": iso3_cur, "city": ""})
+        st.query_params.update({"iso3": iso3_cur})
         st.rerun()
 
     MAP_HEIGHT = 640
     if iso3 and iso3 != "—":
         freq_for_map = st.session_state.get("opt_freq_w", "Monthly")
-        codes = _resolve_ws_codes()
-        df_latest = load_latest_adm1_for_map(iso3, freq_for_map, avg_code=codes["AVG"])
+        df_latest = load_latest_adm1_for_map(iso3, freq_for_map)
+        if isinstance(df_latest, tuple): df_latest = df_latest[0]
 
         if df_latest.empty:
             sel = st.session_state.get("opt_freq_w","Monthly")
-            st.warning(f"No ADM1 windspeeds data found for **{iso3} — {sel}**.", icon="⚠️")
+            st.warning(f"No ADM1 WSPA data found for **{iso3} — {sel}**.", icon="⚠️")
         else:
             with st.spinner("Loading ADM1 boundaries…"):
                 try:
@@ -425,35 +507,11 @@ with lc:
             latest_norm = df_latest.assign(__key=df_latest["ADM1"].map(_norm_str))
             df_map = gdf_norm.merge(latest_norm[["__key","value","Date"]], on="__key", how="left").drop(columns="__key")
 
-            # Elevation merge (same as other pages)
-            def _load_city_map():
-                here = os.path.dirname(__file__)
-                candidates = [
-                    os.path.normpath(os.path.join(here, "..", "city_mapper_with_coords_v3.csv")),
-                    os.path.normpath(os.path.join(here, "..", "city_mapper_with_coords_v2.csv")),
-                    os.path.join(here, "city_mapper_with_coords_v3.csv"),
-                    os.path.join(here, "city_mapper_with_coords_v2.csv"),
-                    "/mnt/data/city_mapper_with_coords_v3.csv",
-                    "/mnt/data/city_mapper_with_coords_v2.csv",
-                ]
-                for fp in candidates:
-                    try:
-                        if os.path.isfile(fp):
-                            df = pd.read_csv(fp)
-                            cn_country = next((c for c in df.columns if c.lower()=="country"), None)
-                            cn_city    = next((c for c in df.columns if c.lower()=="city"), None)
-                            cn_elev    = next((c for c in df.columns if "elev" in c.lower()), None)
-                            if not (cn_country and cn_city and cn_elev): continue
-                            df = df.rename(columns={cn_country:"ADM0", cn_city:"ADM1", cn_elev:"elevation"})
-                            df["ADM0"] = df["ADM0"].astype(str).str.upper().str.strip()
-                            df["ADM1"] = df["ADM1"].astype(str).str.strip()
-                            df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
-                            return df[["ADM0","ADM1","elevation"]].copy()
-                    except Exception:
-                        continue
-                return pd.DataFrame(columns=["ADM0","ADM1","elevation"])
-
             CITY_MAP = _load_city_map()
+            elev_complete, _, _ = _elevation_completeness(iso3, geojson_dict, CITY_MAP)
+            if st.session_state.get("last_iso3_for_choice_w") != iso3 or "map_data_choice_w" not in st.session_state:
+                st.session_state["map_data_choice_w"] = "Elevation" if elev_complete else "Windspeed"
+                st.session_state["last_iso3_for_choice_w"] = iso3
             try:
                 cm_iso = CITY_MAP[CITY_MAP["ADM0"].astype(str).str.upper() == iso3][["ADM1","elevation"]].copy()
                 cm_iso["ADM1"] = cm_iso["ADM1"].astype(str)
@@ -465,13 +523,12 @@ with lc:
                 if "elevation" not in df_map.columns:
                     df_map["elevation"] = np.nan
 
-            choice = st.radio("Map data", ["Windspeed","Elevation"], horizontal=True, key="map_data_choice_w",
-                              help="Choose the data shown on the map.")
+            choice = st.radio("Map data", ["Windspeed","Elevation"], horizontal=True, key="map_data_choice_w")
             if choice == "Elevation":
                 color_col = "elevation"; cs_name = "Viridis"; cbar_title = "Elevation (m)"
                 hover_tmpl = "<b>%{customdata[0]}</b><br>Elevation: %{customdata[1]:.0f} m<br>As of: %{customdata[2]}<extra></extra>"
             else:
-                color_col = "value"; cs_name = "Tealgrn"; cbar_title = "Avg Wind (m/s)"
+                color_col = "value"; cs_name = "Blues"; cbar_title = "Wind speed (m/s)"
                 hover_tmpl = "<b>%{customdata[0]}</b><br>Latest: %{customdata[1]:.2f} m/s<br>As of: %{customdata[2]}<extra></extra>"
 
             fig = px.choropleth(
@@ -523,75 +580,33 @@ with lc:
             )
             st.markdown("**Country Map**  \nElevation data is from NASA SRTM (Feb 2000). Switch using the control above.")
 
-# ---------------- RIGHT: CONTROLS + KPIs ----------------
+# ---------------- RIGHT: CONTROLS + KPIs + SUMMARY ----------------
 with rc:
-    # ADM1 list
-    if iso3 and iso3 != "—":
-        try:
-            _, _, name_col_for_list, gdf_for_list = load_country_adm1_geojson(iso3)
-            _adm1_list = sorted(gdf_for_list[name_col_for_list].astype(str).unique().tolist())
-        except Exception:
-            _adm1_list = []
-    else:
-        _adm1_list = []
-    adm1_options = ["Country (all)"] + _adm1_list
-
-    url_city = st.query_params.get("city","")
-    if "opt_adm1_w" not in st.session_state:
-        st.session_state["opt_adm1_w"] = url_city if url_city in adm1_options else "Country (all)"
-
-    sel_adm1 = st.selectbox(
-        "Select Province/City/State",
-        options=adm1_options,
-        index=adm1_options.index(st.session_state["opt_adm1_w"]) if st.session_state["opt_adm1_w"] in adm1_options else 0,
-        key="opt_adm1_w",
-        help="Change the region focus for the charts.",
-    )
-    desired = "" if sel_adm1 in ("","Country (all)") else sel_adm1
-    if desired != st.query_params.get("city",""):
-        st.query_params.update({"city": desired})
-        st.rerun()
-
+    # Indicator & global options
     col_ind, col_form = st.columns([0.35, 0.65], gap="small")
     with col_ind:
         st.markdown("<div style='margin-top:0.2rem'></div>", unsafe_allow_html=True)
         indicator = st.radio("Select climate indicator", INDICATOR_LABELS, index=0, key="opt_indicator_w",
-                             help="Switch indicators.")
-        if indicator == "Temperature":
+                             help="Switch to another indicator page.")
+        def _nav(to_page):
             carry_iso = st.session_state.get("opt_iso3_w","—")
-            carry_adm1 = st.session_state.get("opt_adm1_w","")
-            st.query_params.update({"iso3": "" if carry_iso=="—" else carry_iso,
-                                    "city": "" if carry_adm1 in ("","Country (all)") else carry_adm1})
-            try: st.switch_page("pages/1_Temperature_Dashboard.py")
-            except Exception: st.switch_page("1_Temperature_Dashboard.py")
-        elif indicator == "Precipitation":
-            carry_iso = st.session_state.get("opt_iso3_w","—")
-            carry_adm1 = st.session_state.get("opt_adm1_w","")
-            st.query_params.update({"iso3": "" if carry_iso=="—" else carry_iso,
-                                    "city": "" if carry_adm1 in ("","Country (all)") else carry_adm1})
-            try: st.switch_page("pages/2_Precipitation_Dashboard.py")
-            except Exception: st.switch_page("2_Precipitation_Dashboard.py")
-        elif indicator == "Humidity":
-            carry_iso = st.session_state.get("opt_iso3_w","—")
-            carry_adm1 = st.session_state.get("opt_adm1_w","")
-            st.query_params.update({"iso3": "" if carry_iso=="—" else carry_iso,
-                                    "city": "" if carry_adm1 in ("","Country (all)") else carry_adm1})
-            try: st.switch_page("pages/3_Humidity_Dashboard.py")
-            except Exception: st.switch_page("3_Humidity_Dashboard.py")
+            st.query_params.update({"iso3": "" if carry_iso=="—" else carry_iso})
+            try: st.switch_page(to_page)
+            except Exception: st.switch_page(to_page.split("/")[-1])
+        if indicator == "Temperature": _nav("pages/1_Temperature_Dashboard.py")
+        elif indicator == "Precipitation": _nav("pages/2_Precipitation_Dashboard.py")
+        elif indicator == "Humidity": _nav("pages/3_Humidity_Dashboard.py")
 
     with col_form:
         st.markdown("#### Chart Options")
         with st.form("options_form_w", clear_on_submit=False):
             colA, colB, colC = st.columns(3)
             with colA:
-                data_type = st.radio("Type", ["Historical Observations", "Projections (SSPs)"], index=0, key="opt_type_w",
-                                     help="Choose historical observations or future projections.")
+                data_type = st.radio("Type", ["Historical Observations", "Projections (SSPs)"], index=0, key="opt_type_w")
             with colB:
-                freq = st.radio("Frequency", ["Monthly", "Seasonal", "Annual"], index=0, key="opt_freq_w",
-                                help="Change the temporal aggregation for all charts.")
+                freq = st.radio("Frequency", ["Monthly", "Seasonal", "Annual"], index=0, key="opt_freq_w")
             with colC:
-                source = st.radio("Data Source", ["CDS/CCKP", "CRU", "ERA5"], index=2, key="opt_source_w",
-                                  help="Pick your preferred data provider.")
+                source = st.radio("Data Source", ["CDS/CCKP", "CRU", "ERA5"], index=2, key="opt_source_w")
             st.form_submit_button("Apply changes", type="primary")
 
         st.markdown(
@@ -601,24 +616,22 @@ with rc:
               <span style="font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid #e5e7eb;color:#374151;">Type: {('Historical' if data_type.startswith('Historical') else 'Projections')}</span>
               <span style="font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid #e5e7eb;color:#374151;">Frequency: {freq}</span>
               <span style="font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid #e5e7eb;color:#374151;">Source: {source}</span>
-              <span style="font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid #e5e7eb;color:#374151;">Area: {('Country' if sel_adm1 in ('','Country (all)') else sel_adm1)}</span>
+              <span style="font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid #e5e7eb;color:#374151;">Area: Country (all)</span>
             </div>
             <div style="height:10px;"></div>
             """, unsafe_allow_html=True
         )
 
-    # ===== KPIs (AVG / VAR) with deltas =====
+    # ===== KPIs (WSPA / WSPV) =====
     iso3_now = st.query_params.get("iso3", (st.session_state.get("opt_iso3_w") or "")) or ""
-    adm1_now = st.query_params.get("city","") or st.session_state.get("opt_adm1_w","")
     freq_sel = st.session_state.get("opt_freq_w","Monthly")
-    codes = _resolve_ws_codes()
 
-    def _render_kpi(label: str, value_text: str, delta: float, unit_tip: str = "", show_symbol: bool = True):
-        if delta is None or not (isinstance(delta,(int,float)) and np.isfinite(delta)) or abs(delta) < 1e-12:
+    def render_kpi(label: str, value_text: str, delta: float, show_symbol: bool = True):
+        if delta is None or not (isinstance(delta, (int,float)) and np.isfinite(delta)) or abs(delta) < 1e-12:
             klass, sym, tip = "flat", "—", "No change"
         else:
-            if delta > 0:  klass, sym, tip = "up", "↑", f"+{delta:.2f} {unit_tip}".strip()
-            else:          klass, sym, tip = "down", "↓", f"{delta:.2f} {unit_tip}".strip()
+            if delta > 0:  klass, sym, tip = "up", "↑", f"+{delta:.2f}"
+            else:          klass, sym, tip = "down", "↓", f"{delta:.2f}"
         badge_html = (f'<span class="badge {klass}" title="{tip}">{sym}</span>') if show_symbol else ""
         html = f"""
         <div class="kpi">
@@ -631,20 +644,17 @@ with rc:
         """
         st.markdown(html, unsafe_allow_html=True)
 
-    st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
-
-    base_avg = _prep_single(iso3_now, adm1_now, freq_sel, codes["AVG"], codes["VAR"])
+    base_wspa = _prep_single(iso3_now, "Country (all)", freq_sel, "WSPA", "WSPV")
     k1, k2, k3, k4 = st.columns(4)
-    if base_avg.empty:
-        with k1: st.metric("Latest Avg Wind", "—")
+    if base_wspa.empty:
+        with k1: st.metric("Latest Avg Wind speed (WSPA)", "—")
         with k2: st.metric("Δ vs previous point", "—")
         with k3: st.metric("Δ vs same period LY", "—")
         with k4: st.metric("Mean / σ in range", "—")
     else:
-        srt = base_avg.sort_values("date")
+        srt = base_wspa.sort_values("date")
         latest = float(srt["avg"].iloc[-1])
         prev   = float(srt["avg"].iloc[-2]) if len(srt) > 1 else np.nan
-
         def _same_period_last_year(df):
             dmax = df["date"].max()
             if freq_sel == "Annual":
@@ -654,347 +664,311 @@ with rc:
             tgt = dmax - pd.DateOffset(years=1)
             row = df[(df["date"].dt.year == tgt.year) & (df["date"].dt.month == tgt.month)]
             return row["avg"].iloc[-1] if not row.empty else np.nan
-
         ly_val     = _same_period_last_year(srt)
         delta_prev = latest - prev if np.isfinite(prev) else np.nan
         delta_yoy  = latest - ly_val if np.isfinite(ly_val) else np.nan
         mean_v     = float(np.nanmean(srt["avg"])) if len(srt) else np.nan
-        if "var" in srt.columns:
-            std_v = float(np.nanmean(np.sqrt(srt["var"].clip(lower=0))))
-        else:
-            std_v = float(np.nanstd(srt["avg"]))
-
-        with k1: _render_kpi("Latest Avg Wind", f"{latest:.2f} m/s", delta=None, show_symbol=False)
-        with k2: _render_kpi("Δ vs previous point", (f"{delta_prev:+.2f} m/s" if np.isfinite(delta_prev) else "—"),
-                             delta=(delta_prev if np.isfinite(delta_prev) else None), unit_tip="m/s", show_symbol=True)
+        sigmas     = np.sqrt(srt["var"].clip(lower=0)) if "var" in srt.columns else None
+        std_v      = float(np.nanmean(sigmas)) if (sigmas is not None and sigmas.notna().any()) else float(np.nanstd(srt["avg"]))
+        with k1: st.metric("Latest Avg Wind speed (WSPA)", f"{latest:.2f} m/s")
+        with k2: render_kpi("Δ vs previous point", (f"{delta_prev:+.2f} m/s" if np.isfinite(delta_prev) else "—"), delta_prev)
         ly_label = "Δ vs same month LY" if freq_sel=="Monthly" else ("Δ vs same season LY" if freq_sel=="Seasonal" else "Δ vs same year LY")
-        with k3: _render_kpi(ly_label, (f"{delta_yoy:+.2f} m/s" if np.isfinite(delta_yoy) else "—"),
-                             delta=(delta_yoy if np.isfinite(delta_yoy) else None), unit_tip="m/s", show_symbol=True)
-        with k4: _render_kpi("Mean / σ in range", (f"{mean_v:.2f} m/s • {std_v:.2f}" if np.isfinite(mean_v) and np.isfinite(std_v) else "—"),
-                             delta=None, show_symbol=False)
+        with k3: render_kpi(ly_label, (f"{delta_yoy:+.2f} m/s" if np.isfinite(delta_yoy) else "—"), delta_yoy)
+        with k4: st.metric("Mean / σ in range", (f"{mean_v:.2f} m/s • {std_v:.2f}" if np.isfinite(mean_v) and np.isfinite(std_v) else "—"))
 
     st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
 
-    # === ADM1 compare + info dropdown + summary (under KPIs) ===
-    try:
-        _, _, _name_col_for_list2, _gdf_for_list2 = load_country_adm1_geojson(iso3_now)
-        _adm1_all_choices = sorted(_gdf_for_list2[_name_col_for_list2].astype(str).unique().tolist())
-    except Exception:
-        _adm1_all_choices = []
-
-    _main_label = ("Country (all)" if adm1_now in ("", "Country (all)") else adm1_now)
-    _pool = (["Country (all)"] if _main_label != "Country (all)" else []) + [x for x in _adm1_all_choices if x != _main_label]
-
-    st.markdown("**Compare with other ADM1s or full country (up to 5)**")
-    sel_compare = st.multiselect(
-        "These selections will be added to all charts below.",
-        options=_pool, max_selections=5, key="sel_compare_w",
-        help="The main selection is always included."
-    )
-    geo_list = [_main_label] + [g for g in sel_compare if g != _main_label][:5]
-
+    # ===== Comparison Summary (ALL ADM1s; searchable) =====
+    st.markdown("##### Comparison Summary")
     with st.expander("What do these columns mean?"):
         st.markdown("""
-- **Last date** — latest period available for each ADM1 at the selected frequency.
-- **Latest (m/s)** — average windspeed at the latest period.
-- **Δ prev (m/s)** — change from the immediately previous period.
-- **Δ YoY/YoS (m/s)** — change from the same month/season last year (or previous year for annual).
-- **Mean (m/s)** — arithmetic mean over the displayed series.
-- **σ (m/s)** — typical variability; from variance if available, else std. dev. of the series.
-- **Outlier** — z-score flag on the last point vs a recent window (≥2σ).
+- **Last date** — latest period for the selected frequency.
+- **WSPA/WSPX/WSPN** — latest values (m/s).
+- **WSPV** — variance of average wind speed (unit²); blank if not available.
         """)
 
-    def _freq_window_for_outliers(freq_str: str) -> int:
-        return 12 if freq_str=="Monthly" else (8 if freq_str=="Seasonal" else 5)
+    try:
+        _, _, name_col_for_list, gdf_for_list = load_country_adm1_geojson(iso3_now)
+        all_adm1_names = sorted(gdf_for_list[name_col_for_list].astype(str).unique().tolist())
+    except Exception:
+        all_adm1_names = []
 
-    def _kpi_for_geo(iso3_in: str, geo_label: str, freq_str: str) -> dict:
-        s = _prep_single(iso3_in, geo_label, freq_str, codes["AVG"], codes["VAR"])
-        if s.empty:
-            return {"ADM1": geo_label, "Last date": "—", "Latest (m/s)": np.nan, "Δ prev (m/s)": np.nan,
-                    "Δ YoY/YoS (m/s)": np.nan, "Mean (m/s)": np.nan, "σ (m/s)": np.nan, "Outlier": "—"}
+    def _last_row_for(code, freq_str, area):
+        s = _prep_single(iso3_now, area, freq_str, code, None)
+        if s.empty: return "—", np.nan
+        s = s.sort_values("date"); d = s["date"].iloc[-1]
+        dstr = (d.strftime("%Y") if freq_str=="Annual"
+                else (f"{MONTH_TO_SEASON[int(d.month)]} {d.year}" if freq_str=="Seasonal" else d.strftime("%Y-%m")))
+        return dstr, float(s["avg"].iloc[-1])
+
+    def _last_var_for(freq_str, area):
+        s = _prep_single(iso3_now, area, freq_str, "WSPA", "WSPV")
+        if s.empty: return np.nan
         s = s.sort_values("date")
-        latest = s.iloc[-1]
-        last_val = float(latest["avg"])
-        prev_val = float(s.iloc[-2]["avg"]) if len(s) > 1 else np.nan
-        if freq_str == "Annual":
-            tgt_yr = latest["date"].year - 1
-            prev_row = s[s["date"].dt.year == tgt_yr]
-        else:
-            tgt = latest["date"] - pd.DateOffset(years=1)
-            prev_row = s[(s["date"].dt.year == tgt.year) & (s["date"].dt.month == tgt.month)]
-        yoy_val = float(prev_row["avg"].iloc[-1]) if not prev_row.empty else np.nan
-        mean_v = float(np.nanmean(s["avg"]))
-        sigmas = np.sqrt(s["var"].clip(lower=0)) if "var" in s.columns else None
-        sigma_v = float(np.nanmean(sigmas)) if (sigmas is not None and sigmas.notna().any()) else float(np.nanstd(s["avg"]))
+        return float(s["var"].iloc[-1]) if ("var" in s.columns and s["var"].notna().any()) else np.nan
 
-        win = _freq_window_for_outliers(freq_str)
-        tail = s.tail(win)["avg"].to_numpy(dtype=float)
-        outlier_flag = "—"
-        if len(tail) >= 3 and np.nanstd(tail) > 0:
-            z = (tail[-1] - np.nanmean(tail)) / np.nanstd(tail)
-            if np.isfinite(z) and abs(z) >= 2.0:
-                outlier_flag = f"{z:+.2f}σ"
+    rows=[]
+    for a in all_adm1_names:
+        d_str, v_wspa = _last_row_for("WSPA", freq_sel, a)
+        _,    v_wspx = _last_row_for("WSPX", freq_sel, a)
+        _,    v_wspn = _last_row_for("WSPN", freq_sel, a)
+        v_var        = _last_var_for(freq_sel, a)
+        rows.append({"ADM1": a, "Last date": d_str, "WSPA (m/s)": v_wspa, "WSPX (m/s)": v_wspx, "WSPN (m/s)": v_wspn, "WSPV": v_var})
 
-        if freq_str == "Monthly":
-            last_date = latest["date"].strftime("%Y-%m")
-        elif freq_str == "Annual":
-            last_date = latest["date"].strftime("%Y")
-        else:
-            last_date = f"{MONTH_TO_SEASON[int(latest['date'].month)]} {latest['date'].year}"
+    df_summary = pd.DataFrame(rows)
 
-        return {
-            "ADM1": geo_label, "Last date": last_date, "Latest (m/s)": round(last_val, 2),
-            "Δ prev (m/s)": (round(last_val - prev_val, 2) if np.isfinite(prev_val) else np.nan),
-            "Δ YoY/YoS (m/s)": (round(last_val - yoy_val, 2) if np.isfinite(yoy_val) else np.nan),
-            "Mean (m/s)": round(mean_v, 2), "σ (m/s)": round(sigma_v, 2), "Outlier": outlier_flag
-        }
+    sel_filter_adm1 = st.multiselect(
+        "Search / filter ADM1s (leave empty to show all)",
+        options=all_adm1_names, default=[], placeholder="Type to search…"
+    )
+    if sel_filter_adm1:
+        df_summary = df_summary[df_summary["ADM1"].isin(sel_filter_adm1)]
 
-    if geo_list:
-        st.markdown("##### Comparison Summary")
-        rows = [_kpi_for_geo(iso3_now, g, freq_sel) for g in geo_list]
-        summary = pd.DataFrame(rows)
-        styler = (
-            summary.style
-                .format(precision=2, na_rep="—")
-                .set_table_styles([{'selector':'th','props':[('text-align','center')]}])
-                .set_properties(**{'text-align':'center'})
-        )
-        st.dataframe(styler, use_container_width=True, hide_index=True)
+    styler = (df_summary.style
+              .format(precision=2, na_rep="—")
+              .set_table_styles([{'selector':'th','props':[('text-align','center')]}])
+              .set_properties(**{'text-align':'center'}))
+    st.dataframe(styler, use_container_width=True, hide_index=True, height=280)
 
 # ===================== DIVIDER =====================
 st.markdown("---")
 
 mapper = load_indicator_mapper()
 iso3_now = st.query_params.get("iso3", (st.session_state.get("opt_iso3_w") or "")) or ""
-adm1_now = st.query_params.get("city","") or st.session_state.get("opt_adm1_w","")
 freq     = st.session_state.get("opt_freq_w","Monthly")
 if not iso3_now:
     st.warning("Select a country to load windspeeds charts.")
     st.stop()
 
-def _season_year_str(series_ts: pd.Series) -> np.ndarray:
-    s = series_ts.dt.month.map(MONTH_TO_SEASON).astype(str) + " " + series_ts.dt.year.astype(str)
-    return s.to_numpy(dtype=object)
-
-def _set_legend_top(fig: "go.Figure"):
+# ===================== Legend helper =====================
+def set_legend_top(fig):
     fig.update_layout(
-        legend=dict(
-            orientation="h",
-            y=1.02, yanchor="bottom",
-            x=0.0,  xanchor="left",
-            bgcolor="rgba(0,0,0,0)",
-            font=dict(size=11),
-            itemwidth=30
-        ),
+        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0.0, xanchor="left", bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
         margin=dict(t=80)
     )
 
-# ===================== Chart renderer (Story | Chart | Options) for AVG only =====================
-def render_chart_with_controls_w(
-    story_title_md: str,
-    plot_title: str,
-    avg_code: str,
-    var_code: str,
-    chart_key: str,
-):
-    main_label = ("Country (all)" if adm1_now in ("", "Country (all)") else adm1_now)
-    comp_list = st.session_state.get("sel_compare_w", []) or []
-    geo_list_local = [main_label] + [g for g in comp_list if g != main_label][:5]
-
-    def _series_for_geo(g):
-        return _prep_single(iso3_now, g, freq, avg_code, var_code)
-
-    sdict = {g: _series_for_geo(g) for g in geo_list_local}
-    sdict = {k:v for k,v in sdict.items() if not v.empty}
-    if not sdict:
-        left, _, _ = st.columns([0.2,0.7,0.1], gap="large")
-        with left: st.info("No data for current selection.")
-        return
-
-    dmin = min(s["date"].min() for s in sdict.values()).date()
-    dmax = max(s["date"].max() for s in sdict.values()).date()
-
+# ===================== CHART RENDERERS =====================
+def _render_ws_chart(chart_key, story_title_md, plot_title, avg_code, var_code=None, *, ylab="m/s", show_form=False):
+    # columns: 0.2 | 0.7 | 0.1  (WSPX/WSPN will bypass form)
     story_col, chart_col, opts_col = st.columns([0.2, 0.7, 0.1], gap="large")
 
     with story_col:
         st.markdown(story_title_md)
 
-    with opts_col:
-        with st.form(f"form_{chart_key}"):
-            st.markdown("**Display options**")
-            show_avg  = st.checkbox("Show average", value=True, key=f"{chart_key}_avg")
-            show_band = st.checkbox("Show ±1σ band", value=True, key=f"{chart_key}_band")
-            st.form_submit_button("Apply changes", type="primary")
-            if st.session_state.get(f"{chart_key}_dummy", False):
-                st.session_state[f"{chart_key}_dummy"] = False
+    if show_form:
+        with opts_col:
+            with st.form(f"form_{chart_key}"):
+                st.markdown("**Display options**", help="Only affects this chart.")
+                show_avg  = st.checkbox("Show average", value=True,  key=f"{chart_key}_avg")
+                show_band = st.checkbox("Show ±1σ band", value=True, key=f"{chart_key}_band")
+                st.form_submit_button("Apply changes", type="primary")
+    else:
+        show_avg, show_band = True, False
 
+    # ADM1 selector (this chart only)
+    try:
+        _, _, nc, gdf_all = load_country_adm1_geojson(iso3_now)
+        _adm1_all = sorted(gdf_all[nc].astype(str).unique().tolist())
+    except Exception:
+        _adm1_all = []
     with chart_col:
-        d1, d2 = st.slider(
-            "Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax),
-            format="YYYY-MM", key=f"rng_{chart_key}"
+        adm1_sel = st.multiselect(
+            "Compare ADM1s (max 5)",
+            options=_adm1_all,
+            default=st.session_state.get(f"{chart_key}_adm1s", []),
+            max_selections=5, key=f"{chart_key}_adm1s",
+            placeholder="Type to search and select ADM1s…",
+            help="Adds selected ADM1 lines to THIS chart (Country baseline is always shown)."
         )
-        fig = go.Figure()
-        palette = list(CBLIND.values())
 
-        for i, (label, s) in enumerate(sdict.items()):
-            s2 = s[(s["date"] >= pd.to_datetime(d1)) & (s["date"] <= pd.to_datetime(d2))].copy()
-            if s2.empty: 
-                continue
-            color = palette[i % len(palette)]
+    def _series_for(area):
+        codes = [avg_code] + ([var_code] if var_code else [])
+        df_codes, _ = load_scope_series(iso3_now, freq, area, codes)
+        if df_codes.empty or avg_code not in df_codes:
+            return pd.DataFrame(columns=["date","avg","var"])
+        out = pd.DataFrame({"date": df_codes["date"], "avg": pd.to_numeric(df_codes[avg_code], errors="coerce")})
+        if var_code and var_code in df_codes:
+            out["var"] = pd.to_numeric(df_codes[var_code], errors="coerce")
+        return out.dropna(subset=["date"]).sort_values("date")
 
-            N = len(s2)
-            label_arr = np.full(N, label, dtype=object)
-            avg_arr   = pd.to_numeric(s2["avg"], errors="coerce").to_numpy(dtype=float)
-            if "var" in s2.columns:
-                sigma_arr = np.sqrt(pd.to_numeric(s2["var"], errors="coerce").clip(lower=0)).to_numpy(dtype=float)
-            else:
-                sigma_arr = np.full(N, np.nan)
-            season_hdr = _season_year_str(s2["date"]) if freq == "Seasonal" else np.full(N, "", dtype=object)
-
-            customdata = np.empty((N, 3), dtype=object)  # [ADM1, avg, sigma]
-            customdata[:, 0] = label_arr
-            customdata[:, 1] = avg_arr
-            customdata[:, 2] = sigma_arr
-
-            if show_band and np.isfinite(sigma_arr).any():
-                fig.add_trace(go.Scatter(
-                    x=s2["date"], y=avg_arr + sigma_arr, mode="lines",
-                    line=dict(width=0), hoverinfo="skip", showlegend=False
-                ))
-                fig.add_trace(go.Scatter(
-                    x=s2["date"], y=avg_arr - sigma_arr, mode="lines",
-                    line=dict(width=0), fill="tonexty",
-                    fillcolor="rgba(0,114,178,0.18)", hoverinfo="skip",
-                    name=f"{label} — ±1σ", showlegend=False
-                ))
-
-            if show_avg:
-                header = "%{x|%b %Y}" if freq=="Monthly" else ("%{x|%Y}" if freq=="Annual" else "%{text}")
-                hover_tmpl = (
-                    "<b>" + header + "</b><br>" +
-                    "<b>%{customdata[0]}</b><br>" +
-                    "Avg. Wind: %{customdata[1]:.2f} m/s<br>" +
-                    "%{customdata[2]:.2f} m/s (±1σ)<extra></extra>"
-                )
-                fig.add_trace(go.Scatter(
-                    x=s2["date"], y=s2["avg"], mode="lines",
-                    line=dict(color=color, width=2),
-                    name=f"{label} — Avg. Wind",
-                    customdata=customdata,
-                    text=(season_hdr if freq=="Seasonal" else None),
-                    hovertemplate=hover_tmpl
-                ))
-
-        fig.update_layout(
-            title=plot_title, height=420, margin=dict(l=30,r=30,t=40,b=50),
-            hovermode="x unified", xaxis_title="Date", yaxis_title="m/s",
-        )
-        _set_legend_top(fig)
-        if freq == "Monthly": fig.update_xaxes(tickformat="%b\n%Y")
-        elif freq == "Seasonal": fig.update_xaxes(tickformat="%Y")
-        else: fig.update_xaxes(tickformat="%Y")
-        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
-
-# ===================== Simple renderer (no options) for MAX/MIN =====================
-def render_simple_chart_w(story_md: str, title: str, avg_code: str, chart_key: str, units="m/s"):
-    main_label = ("Country (all)" if adm1_now in ("", "Country (all)") else adm1_now)
-    comp_list = st.session_state.get("sel_compare_w", []) or []
-    geo_list_local = [main_label] + [g for g in comp_list if g != main_label][:5]
-
-    def _series_for(g):
-        return _prep_single(iso3_now, g, freq, avg_code, None)
-
-    sdict = {g: _series_for(g) for g in geo_list_local}
+    targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
+    sdict = {g: _series_for(g) for g in targets}
     sdict = {k:v for k,v in sdict.items() if not v.empty}
     if not sdict:
-        left, _, _ = st.columns([0.2, 0.79, 0.01], gap="large")
-        with left: st.info("No data for current selection.")
+        with chart_col: st.info("No data for current selection.")
         return
 
     dmin = min(s["date"].min() for s in sdict.values()).date()
     dmax = max(s["date"].max() for s in sdict.values()).date()
+    with chart_col:
+        if freq == "Seasonal":
+            # Build Season–Year labels from the baseline series (“Country (all)” or first available)
+            base_label = "Country (all)" if "Country (all)" in sdict else next(iter(sdict))
+            s_base = sdict[base_label].dropna(subset=["date"]).sort_values("date")
+            if s_base.empty:
+                st.info("No data for current selection."); return
+            labels, idx_map = _season_labels_and_index(s_base["date"])
+            sel_start, sel_end = st.select_slider(
+                "Date range", options=labels, value=(labels[0], labels[-1]),
+                key=f"rng_{chart_key}"
+            )
+            d1, d2 = idx_map[sel_start], idx_map[sel_end]
+        else:
+            fmt = ("YYYY-MM" if freq == "Monthly" else "YYYY")
+            d1, d2 = st.slider("Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax),
+                            format=fmt, key=f"rng_{chart_key}")
+            d1, d2 = pd.to_datetime(d1), pd.to_datetime(d2)
 
+
+        fig = go.Figure()
+        palette = list(CBLIND.values())
+
+        for i, (label, s) in enumerate(sdict.items()):
+            s2 = s[(s["date"]>=pd.to_datetime(d1)) & (s["date"]<=pd.to_datetime(d2))]
+            if s2.empty: continue
+            color = palette[i % len(palette)]
+
+            # customdata: [ADM1, sigma]
+            if "var" in s2.columns:
+                sigma_arr = np.sqrt(pd.to_numeric(s2["var"], errors="coerce").clip(lower=0)).to_numpy(float)
+            else:
+                sigma_arr = np.full(len(s2), np.nan)
+
+            hdr_cd = s2["date"].apply(lambda x: _format_hover_date(pd.to_datetime(x), freq)).to_numpy(object)
+
+            blocks = ["Average: %{y:.2f} " + ylab]
+            if show_form and show_band and np.isfinite(sigma_arr).any():
+                blocks.append("±1σ: %{customdata[1]:.2f} " + ylab)
+
+            fig.add_trace(go.Scatter(
+                x=s2["date"], y=s2["avg"], mode="lines",
+                line=dict(color=color, width=2),
+                name=f"{label} — Average",
+                customdata=np.stack([np.full(len(s2), label, dtype=object), sigma_arr, hdr_cd], axis=-1),
+                hovertemplate="<b>%{customdata[2]}</b><br><b>%{customdata[0]}</b><br>"+ "<br>".join(blocks) +"<extra></extra>"
+            ))
+
+
+            if show_form and show_band and np.isfinite(sigma_arr).any():
+                fig.add_trace(go.Scatter(x=s2["date"], y=s2["avg"]+sigma_arr, mode="lines", line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(x=s2["date"], y=s2["avg"]-sigma_arr, mode="lines", fill='tonexty', line=dict(width=0),
+                                         name="±1σ", hoverinfo='skip', fillcolor="rgba(0,114,178,0.18)"))
+
+        fig.update_layout(title=plot_title, height=420, margin=dict(l=30,r=30,t=40,b=50),
+                          hovermode="x unified", xaxis_title="Date", yaxis_title=ylab)
+        set_legend_top(fig)
+        if freq == "Monthly": fig.update_xaxes(tickformat="%b\n%Y")
+        else:                  fig.update_xaxes(tickformat="%Y")
+        st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
+
+def _render_simple(chart_key, story_title_md, plot_title, avg_code, ylab="m/s"):
+    # columns: 0.2 | 0.79 | 0.01
     story_col, chart_col, _ = st.columns([0.2, 0.79, 0.01], gap="large")
 
     with story_col:
-        st.markdown(story_md)
+        st.markdown(story_title_md)
 
+    # ADM1 selector (this chart only)
+    try:
+        _, _, nc, gdf_all = load_country_adm1_geojson(iso3_now)
+        _adm1_all = sorted(gdf_all[nc].astype(str).unique().tolist())
+    except Exception:
+        _adm1_all = []
     with chart_col:
-        d1, d2 = st.slider(
-            "Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax),
-            format="YYYY-MM", key=f"rng_{chart_key}"
+        adm1_sel = st.multiselect(
+            "Compare ADM1s (max 5)",
+            options=_adm1_all,
+            default=st.session_state.get(f"{chart_key}_adm1s", []),
+            max_selections=5, key=f"{chart_key}_adm1s",
+            placeholder="Type to search and select ADM1s…"
         )
+
+    def _series_for(area):
+        s = _prep_single(iso3_now, area, freq, avg_code, None)
+        return s
+
+    targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
+    sdict = {g: _series_for(g) for g in targets}
+    sdict = {k:v for k,v in sdict.items() if not v.empty}
+    if not sdict:
+        with chart_col: st.info("No data for current selection.")
+        return
+
+    dmin = min(s["date"].min() for s in sdict.values()).date()
+    dmax = max(s["date"].max() for s in sdict.values()).date()
+    with chart_col:
+        if freq == "Seasonal":
+            # Build Season–Year labels from the baseline series (“Country (all)” or first available)
+            base_label = "Country (all)" if "Country (all)" in sdict else next(iter(sdict))
+            s_base = sdict[base_label].dropna(subset=["date"]).sort_values("date")
+            if s_base.empty:
+                st.info("No data for current selection."); return
+            labels, idx_map = _season_labels_and_index(s_base["date"])
+            sel_start, sel_end = st.select_slider(
+                "Date range", options=labels, value=(labels[0], labels[-1]),
+                key=f"rng_{chart_key}"
+            )
+            d1, d2 = idx_map[sel_start], idx_map[sel_end]
+        else:
+            fmt = ("YYYY-MM" if freq == "Monthly" else "YYYY")
+            d1, d2 = st.slider("Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax),
+                            format=fmt, key=f"rng_{chart_key}")
+            d1, d2 = pd.to_datetime(d1), pd.to_datetime(d2)
+
         fig = go.Figure()
         colors = list(CBLIND.values())
 
         for i, (label, s) in enumerate(sdict.items()):
-            s2 = s[(s["date"]>=pd.to_datetime(d1)) & (s["date"]<=pd.to_datetime(d2))].copy()
-            if s2.empty:
-                continue
+            s2 = s[(s["date"]>=pd.to_datetime(d1)) & (s["date"]<=pd.to_datetime(d2))]
+            if s2.empty: continue
             color = colors[i % len(colors)]
-            N = len(s2)
-            label_arr = np.full(N, label, dtype=object)
-            avg_arr   = pd.to_numeric(s2["avg"], errors="coerce").to_numpy(dtype=float)
-            season_hdr = _season_year_str(s2["date"]) if freq == "Seasonal" else np.full(N, "", dtype=object)
-            customdata = np.empty((N, 2), dtype=object)  # [ADM1, avg]
-            customdata[:,0] = label_arr
-            customdata[:,1] = avg_arr
-            header = "%{x|%b %Y}" if freq=="Monthly" else ("%{x|%Y}" if freq=="Annual" else "%{text}")
-            hover_tmpl = (
-                "<b>" + header + "</b><br>" +
-                "<b>%{customdata[0]}</b><br>" +
-                f"Value: "+"%{customdata[1]:.2f} "+units+"<extra></extra>"
-            )
+            hdr_cd = s2["date"].apply(lambda x: _format_hover_date(pd.to_datetime(x), freq)).to_numpy(object)
             fig.add_trace(go.Scatter(
                 x=s2["date"], y=s2["avg"], mode="lines",
-                line=dict(color=color, width=2),
-                name=f"{label}",
-                customdata=customdata,
-                text=(season_hdr if freq=="Seasonal" else None),
-                hovertemplate=hover_tmpl
+                name=f"{label}", line=dict(color=color, width=2),
+                customdata=np.stack([np.full(len(s2), label, dtype=object), hdr_cd], axis=-1),
+                hovertemplate="<b>%{customdata[1]}</b><br><b>%{customdata[0]}</b><br>Value: %{y:.2f} "+ylab+"<extra></extra>"
             ))
 
+
         fig.update_layout(
-            title=title, height=420, margin=dict(l=30,r=30,t=40,b=50),
-            hovermode="x unified", xaxis_title="Date", yaxis_title=units
+            title=plot_title, height=420, margin=dict(l=30,r=30,t=40,b=50),
+            hovermode="x unified", xaxis_title="Date", yaxis_title=ylab
         )
+        set_legend_top(fig)
         if freq == "Monthly": fig.update_xaxes(tickformat="%b\n%Y")
-        elif freq == "Seasonal": fig.update_xaxes(tickformat="%Y")
-        else: fig.update_xaxes(tickformat="%Y")
-        _set_legend_top(fig)
+        else:                  fig.update_xaxes(tickformat="%Y")
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 # ===================== CHARTS =====================
 st.markdown("### Windspeeds Indicators")
 
-_codes = _resolve_ws_codes()
-avg_code, var_code, max_code, min_code = _codes["AVG"], _codes["VAR"], _codes["MAX"], _codes["MIN"]
-
-# Average (+ band)
-render_chart_with_controls_w(
-    story_title_md="**Story — Average Wind Speed**  \nTrend and variability in windspeed.",
-    plot_title="Average Wind Speed + Variability",
-    avg_code=avg_code, var_code=var_code,
-    chart_key="ws_avg"
+# WSPA (+ band) with options
+__title_wspa = "Average Wind Speed (WSPA)"
+_render_ws_chart(
+    chart_key="wspa",
+    story_title_md=f"**Story — {__title_wspa}**  \nTrend and variability in near-surface wind speed.",
+    plot_title=__title_wspa,
+    avg_code="WSPA", var_code="WSPV", ylab="m/s", show_form=True
 )
 
-# Maximum (single-line)
-if max_code:
-    render_simple_chart_w(
-        story_md="**Story — Maximum Wind Speed**  \nAverage of daily maxima.",
-        title="Maximum Wind Speed",
-        avg_code=max_code,
-        chart_key="ws_max",
-    )
+# WSPX (no options)
+__title_wspx = "Maximum Wind Speed (WSPX)"
+_render_simple(
+    chart_key="wspx",
+    story_title_md=f"**Story — {__title_wspx}**",
+    plot_title=__title_wspx,
+    avg_code="WSPX", ylab="m/s"
+)
 
-# Minimum (single-line)
-if min_code:
-    render_simple_chart_w(
-        story_md="**Story — Minimum Wind Speed**  \nAverage of daily minima.",
-        title="Minimum Wind Speed",
-        avg_code=min_code,
-        chart_key="ws_min",
-    )
+# WSPN (no options)
+__title_wspn = "Minimum Wind Speed (WSPN)"
+_render_simple(
+    chart_key="wspn",
+    story_title_md=f"**Story — {__title_wspn}**",
+    plot_title=__title_wspn,
+    avg_code="WSPN", ylab="m/s"
+)
 
 # ===================== PERCENTILES =====================
 st.markdown("---")
@@ -1003,9 +977,18 @@ st.subheader("Percentiles")
 pct_choice = st.radio(
     "Select a percentile (applies to all charts below)",
     options=[10,20,30,40,50,60,70,80,90,100],
-    horizontal=True, index=1, key="pct_w_single",
-    help="Choose one percentile line to overlay per ADM1."
+    horizontal=True, index=1, key="pct_w_single"
 )
+
+# Shared ADM1 multiselect for all percentile charts
+try:
+    _, _, name_col_all, gdf_all = load_country_adm1_geojson(iso3_now)
+    pct_adm1_all = sorted(gdf_all[name_col_all].astype(str).unique().tolist())
+except Exception:
+    pct_adm1_all = []
+sel_pct_adm1s = st.multiselect("Compare ADM1s for percentile charts (max 5)",
+                               options=pct_adm1_all, default=[], max_selections=5, key="pct_adm1s_w",
+                               placeholder="Type to search and select ADM1s…")
 
 def _phase_from_date(dt: pd.Timestamp, freq: str) -> int:
     if freq=="Monthly": return int(dt.month)
@@ -1024,16 +1007,16 @@ def _empirical_percentile_curve(s_df: pd.DataFrame, pct: int, freq: str) -> pd.D
     q = d.groupby("_phase")["val"].quantile(pct/100.0)
     return pd.DataFrame({"date": d["date"], "p": d["_phase"].map(q)})
 
-def _percentile_chart_w(title: str, avg_code: str, chart_key: str, story: str):
+def _pct_block(title: str, code: str, chart_key: str, story: str):
     story_col, chart_col, _ = st.columns([0.2, 0.79, 0.01], gap="large")
 
-    main_label = ("Country (all)" if adm1_now in ("", "Country (all)") else adm1_now)
-    comp_list = st.session_state.get("sel_compare_w", []) or []
-    geo_list_local = [main_label] + [g for g in comp_list if g != main_label][:5]
+    def _s_for(area): 
+        df_codes, _ = load_scope_series(iso3_now, freq, area, [code])
+        if df_codes.empty or code not in df_codes: return pd.DataFrame(columns=["date","avg"])
+        return pd.DataFrame({"date": df_codes["date"], "avg": pd.to_numeric(df_codes[code], errors="coerce")}).dropna().sort_values("date")
 
-    def _s_for(g):
-        return _prep_single(iso3_now, g, freq, avg_code, None)
-    sdict = {g: _s_for(g) for g in geo_list_local}
+    targets = ["Country (all)"] + [a for a in sel_pct_adm1s if a != "Country (all)"]
+    sdict = {g: _s_for(g) for g in targets}
     sdict = {k:v for k,v in sdict.items() if not v.empty}
     if not sdict:
         with story_col: st.info("No data for percentiles.")
@@ -1046,27 +1029,31 @@ def _percentile_chart_w(title: str, avg_code: str, chart_key: str, story: str):
         st.markdown(f"**Story — {title}**  \n{story}")
 
     with chart_col:
-        d1, d2 = st.slider(
-            "Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax),
-            format="YYYY-MM", key=f"rng_{chart_key}"
-        )
-        fig = go.Figure()
-        colors = list(CBLIND.values())
+        if freq == "Seasonal":
+            base_label = "Country (all)" if "Country (all)" in sdict else next(iter(sdict))
+            s_base = sdict[base_label].dropna(subset=["date"]).sort_values("date")
+            if s_base.empty:
+                st.info("No data for percentiles."); return
+            labels, idx_map = _season_labels_and_index(s_base["date"])
+            sel_start, sel_end = st.select_slider(
+                "Date range", options=labels, value=(labels[0], labels[-1]),
+                key=f"rng_{chart_key}"
+            )
+            d1, d2 = idx_map[sel_start], idx_map[sel_end]
+        else:
+            fmt = ("YYYY-MM" if freq == "Monthly" else "YYYY")
+            d1, d2 = st.slider("Date range", min_value=dmin, max_value=dmax, value=(dmin, dmax),
+                            format=fmt, key=f"rng_{chart_key}")
+            d1, d2 = pd.to_datetime(d1), pd.to_datetime(d2)
 
+
+        fig = go.Figure(); colors = list(CBLIND.values())
         for i, (label, s) in enumerate(sdict.items()):
-            s2 = s[(s["date"]>=pd.to_datetime(d1)) & (s["date"]<=pd.to_datetime(d2))].copy()
-            if s2.empty: 
-                continue
+            s2 = s[(s["date"]>=pd.to_datetime(d1)) & (s["date"]<=pd.to_datetime(d2))]
+            if s2.empty: continue
             color = colors[i % len(colors)]
-
-            # Average
-            fig.add_trace(go.Scatter(
-                x=s2["date"], y=s2["avg"], mode="lines",
-                name=f"{label} — Avg",
-                line=dict(color=color, width=1.6),
-            ))
-
-            # Single percentile line
+            fig.add_trace(go.Scatter(x=s2["date"], y=s2["avg"], mode="lines",
+                                     name=f"{label} — Avg", line=dict(color=color, width=1.6)))
             pc = _empirical_percentile_curve(s2, int(pct_choice), freq)
             if not pc.empty:
                 fig.add_trace(go.Scatter(
@@ -1075,22 +1062,17 @@ def _percentile_chart_w(title: str, avg_code: str, chart_key: str, story: str):
                     line=dict(color=color, width=1.2, dash="dot"),
                 ))
 
-        fig.update_layout(
-            title=title, height=420, margin=dict(l=30,r=30,t=40,b=50),
-            hovermode="x unified", xaxis_title="Date", yaxis_title="m/s",
-        )
-        _set_legend_top(fig)
-        if freq == "Monthly":   fig.update_xaxes(tickformat="%b\n%Y")
-        elif freq == "Seasonal": fig.update_xaxes(tickformat="%Y")
-        else:                    fig.update_xaxes(tickformat="%Y")
+        fig.update_layout(title=title, height=420, margin=dict(l=30,r=30,t=40,b=50),
+                          hovermode="x unified", xaxis_title="Date", yaxis_title="m/s")
+        set_legend_top(fig)
+        if freq == "Monthly": fig.update_xaxes(tickformat="%b\n%Y")
+        else:                  fig.update_xaxes(tickformat="%Y")
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 _pct_story = "How values compare with the historical distribution for the same month/season."
-mapper = load_indicator_mapper()
-_percentile_chart_map = []
-if avg_code: _percentile_chart_map.append((_compose_title(avg_code, mapper, "Average Wind — Percentiles"), avg_code, "pct_w_avg"))
-if max_code: _percentile_chart_map.append((_compose_title(max_code, mapper, "Maximum Wind — Percentiles"), max_code, "pct_w_max"))
-if min_code: _percentile_chart_map.append((_compose_title(min_code, mapper, "Minimum Wind — Percentiles"), min_code, "pct_w_min"))
-
-for _title, _code, _key in _percentile_chart_map:
-    _percentile_chart_w(_title, _code, _key, _pct_story)
+for _title, _code, _key in [
+    ("Average Wind Speed — Percentiles", "WSPA", "pct_wspa"),
+    ("Maximum Wind Speed — Percentiles", "WSPX", "pct_wspx"),
+    ("Minimum Wind Speed — Percentiles", "WSPN", "pct_wspn"),
+]:
+    _pct_block(_title, _code, _key, _pct_story)
