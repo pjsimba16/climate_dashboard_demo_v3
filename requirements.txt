@@ -1,0 +1,23 @@
+# Core app
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+plotly>=5.22
+
+# Parquet I/O
+pyarrow>=15
+
+# Hugging Face downloads
+huggingface_hub>=0.25
+
+# Country names (nice-to-have but used in code paths)
+pycountry>=23.12.11
+
+# Geo stack (for reading ADM1 GeoJSONs with GeoPandas)
+geopandas>=0.14
+shapely>=2.0
+fiona>=1.9
+pyproj>=3.6
+
+# Plotly click capture used on Home and dashboards
+streamlit-plotly-events>=0.0.6
