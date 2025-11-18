@@ -37,6 +37,9 @@ HF_REPO_ID   = "pjsimba16/adb-climate-data"  # <— your Space
 HF_REPO_PREF = ("space", "dataset")          # try Space first; then dataset fallback
 
 # ==== DEBUG PANEL (toggle by ?debug=1) ====
+def _note_err(msg: str):
+    st.session_state.setdefault("hf_errors", []).append(str(msg))
+
 debug_on = str(st.query_params.get("debug", ["0"])[0]).lower() in {"1","true","yes"}
 
 if debug_on:
@@ -127,8 +130,7 @@ if debug_on:
             st.info("No HF errors recorded yet.")
 
 
-def _note_err(msg: str):
-    st.session_state.setdefault("hf_errors", []).append(str(msg))
+
 
 def _get_hf_token() -> str:
     try:
