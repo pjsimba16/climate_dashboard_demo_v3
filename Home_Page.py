@@ -419,7 +419,13 @@ def compute_data_through() -> str:
 
 data_through = compute_data_through()
 
-badge_dt = (pd.to_datetime(data_through).strftime("%b %Y") if data_through is not None else "—")
+def _fmt_badge_dt(x):
+    ts = pd.to_datetime(x, errors="coerce")
+    return ts.strftime("%b %Y") if (ts is not pd.NaT and pd.notna(ts)) else "—"
+
+badge_dt = data_through or "—"
+
+
 
 # ===== HERO (unchanged) =====
 left, right = st.columns([0.62, 0.38], gap="large")
@@ -769,9 +775,13 @@ else:
 # Update "Data through" (latest of all four)
 latest_candidates = []
 for df in (g_temp, g_prec, g_hum, g_wspd):
-    if df is not None and not df.empty:
-        latest_candidates.append(df["Date"].max())
+    if df is not None and not df.empty and "Date" in df.columns:
+        latest_candidates.append(pd.to_datetime(df["Date"], errors="coerce").max())
+
+# drop NaT entries before taking max
+latest_candidates = [d for d in latest_candidates if pd.notna(d)]
 data_through = max(latest_candidates) if latest_candidates else None
+
 
 # Latest datapoint histograms (two rows)
 def _latest_by_country(df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
