@@ -21,3 +21,6 @@ pyproj>=3.6
 
 # Plotly click capture used on Home and dashboards
 streamlit-plotly-events>=0.0.6
+
+requests
+
