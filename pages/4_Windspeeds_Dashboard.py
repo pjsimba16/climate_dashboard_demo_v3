@@ -357,7 +357,7 @@ st.markdown("""
   gap:0.4rem;
 }
 .kpi .value {
-  font-size:3.00rem;
+  font-size:2.50rem;
   font-weight:600;
   color:#0f172a;
 }
@@ -1641,3 +1641,4 @@ for _title, _code, _key in [
     ("Minimum Wind Speed — Percentiles", "WSPN", "pct_wspn"),
 ]:
     _pct_block(_title, _code, _key, _pct_story)
+
