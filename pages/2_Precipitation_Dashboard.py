@@ -371,7 +371,7 @@ st.markdown("""
   gap:0.4rem;
 }
 .kpi .value {
-  font-size:3.00rem;
+  font-size:2.50rem;
   font-weight:600;
   color:#0f172a;
 }
@@ -1687,3 +1687,4 @@ _percentile_chart_map = [
 ]
 for _title, _code, _key in _percentile_chart_map:
     _percentile_chart_p(_title, _code, _key, _pct_story, units=("mm" if _code=="PCPS" else "mm/day"))
+
