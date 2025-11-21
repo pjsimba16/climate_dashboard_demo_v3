@@ -687,77 +687,84 @@ st.caption(
     "Shaded countries have at least one ADM0 climate indicator available in the database."
 )
 
-region_isos = _isos_for_region(st.session_state["region_scope"], all_countries["iso3"])
-plot_df = all_countries[all_countries["iso3"].isin(region_isos)].copy()
-plot_df["hovertext"] = plot_df.apply(
-    lambda r: f"{r['name']}<br><span>Indicators: {r['badges']}</span>", axis=1
-)
-plot_df["val"] = plot_df["has_data_any"].astype(float)
+try:
+    st.write("DEBUG world map:",
+             "region_scope =", st.session_state.get("region_scope"),
+             "all_countries rows =", len(all_countries))
 
-map_h = 800  # increased map height for more vertical space
-
-fig = go.Figure(
-    go.Choropleth(
-        locations=plot_df["iso3"],
-        z=plot_df["val"],
-        locationmode="ISO-3",
-        colorscale=[[0.0, "#d4d4d8"], [1.0, "#12a39a"]],
-        zmin=0.0,
-        zmax=1.0,
-        autocolorscale=False,
-        showscale=False,
-        hoverinfo="text",
-        text=plot_df["hovertext"],
-        customdata=plot_df[["iso3"]].to_numpy(),
-        marker_line_width=1.6,
-        marker_line_color="rgba(0,0,0,0.70)",
+    region_isos = _isos_for_region(st.session_state["region_scope"], all_countries["iso3"])
+    plot_df = all_countries[all_countries["iso3"].isin(region_isos)].copy()
+    plot_df["hovertext"] = plot_df.apply(
+        lambda r: f"{r['name']}<br><span>Indicators: {r['badges']}</span>", axis=1
     )
-)
-
-scope_map = {
-    "World": "world",
-    "Africa": "africa",
-    "Asia": "asia",
-    "Europe": "europe",
-    "North America": "north america",
-    "South America": "south america",
-    "Oceania": "world",
-}
-
-fig.update_layout(
-    margin=dict(l=0, r=0, t=0, b=0),
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(0,0,0,0)",
-    height=map_h,
-    geo=dict(
-        projection_type="robinson",
-        showframe=False,
-        showcoastlines=False,
-        showocean=False,
-        bgcolor="rgba(0,0,0,0)",
-        scope=scope_map.get(st.session_state["region_scope"], "world"),
-        fitbounds="locations"
-        if st.session_state["region_scope"] != "World"
-        else None,
-        lataxis_range=[-60, 85]
-        if st.session_state["region_scope"] == "World"
-        else None,
-    ),
-)
-
-st.markdown('<div class="full-bleed">', unsafe_allow_html=True)
-if plotly_events is not None:
-    events = plotly_events(
-        fig,
-        click_event=True,
-        hover_event=False,
-        override_height=map_h,
-        override_width="100%",
+    plot_df["val"] = plot_df["has_data_any"].astype(float)
+    
+    map_h = 800  # increased map height for more vertical space
+    
+    fig = go.Figure(
+        go.Choropleth(
+            locations=plot_df["iso3"],
+            z=plot_df["val"],
+            locationmode="ISO-3",
+            colorscale=[[0.0, "#d4d4d8"], [1.0, "#12a39a"]],
+            zmin=0.0,
+            zmax=1.0,
+            autocolorscale=False,
+            showscale=False,
+            hoverinfo="text",
+            text=plot_df["hovertext"],
+            customdata=plot_df[["iso3"]].to_numpy(),
+            marker_line_width=1.6,
+            marker_line_color="rgba(0,0,0,0.70)",
+        )
     )
-else:
-    st.plotly_chart(fig, use_container_width=True)
-    events = []
-st.markdown("</div>", unsafe_allow_html=True)
+    
+    scope_map = {
+        "World": "world",
+        "Africa": "africa",
+        "Asia": "asia",
+        "Europe": "europe",
+        "North America": "north america",
+        "South America": "south america",
+        "Oceania": "world",
+    }
+    
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=map_h,
+        geo=dict(
+            projection_type="robinson",
+            showframe=False,
+            showcoastlines=False,
+            showocean=False,
+            bgcolor="rgba(0,0,0,0)",
+            scope=scope_map.get(st.session_state["region_scope"], "world"),
+            fitbounds="locations"
+            if st.session_state["region_scope"] != "World"
+            else None,
+            lataxis_range=[-60, 85]
+            if st.session_state["region_scope"] == "World"
+            else None,
+        ),
+    )
+    
+    st.markdown('<div class="full-bleed">', unsafe_allow_html=True)
+    if plotly_events is not None:
+        events = plotly_events(
+            fig,
+            click_event=True,
+            hover_event=False,
+            override_height=map_h,
+            override_width="100%",
+        )
+    else:
+        st.plotly_chart(fig, use_container_width=True)
+        events = []
+    st.markdown("</div>", unsafe_allow_html=True)
+except Exception as e:
+    st.error(f"World map failed: {type(e).__name__}: {e}")
 
 clicked_iso3 = None
 if events:
