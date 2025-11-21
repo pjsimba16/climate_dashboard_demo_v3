@@ -1,8 +1,8 @@
 # Core app
-streamlit>=1.32.2
+streamlit>=1.50.0
 pandas>=2.2
 numpy>=1.26
-plotly>=5.24.1
+plotly>=5.15.0
 
 # Parquet I/O
 pyarrow>=15
@@ -23,5 +23,6 @@ pyproj>=3.6
 streamlit-plotly-events>=0.0.6
 
 requests
+
 
 
