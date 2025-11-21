@@ -709,73 +709,73 @@ else:
     plot_df["val"] = plot_df["has_data_any"].astype(float)
 
     with st.expander("Debug: world map (remove later)"):
-    import plotly
-    st.write("Streamlit version:", st.__version__)
-    st.write("Plotly version:", plotly.__version__)
-
-    try:
-        import streamlit_plotly_events as spe
+        import plotly
+        st.write("Streamlit version:", st.__version__)
+        st.write("Plotly version:", plotly.__version__)
+    
+        try:
+            import streamlit_plotly_events as spe
+            st.write(
+                "streamlit_plotly_events version:",
+                getattr(spe, "__version__", "unknown"),
+            )
+        except Exception as e:
+            st.write("streamlit_plotly_events import FAILED:", e)
+    
+        st.write("plotly_events is None:", plotly_events is None)
         st.write(
-            "streamlit_plotly_events version:",
-            getattr(spe, "__version__", "unknown"),
+            "AVAILABLE_INDICATORS:", AVAILABLE_INDICATORS,
+            "| has_data_any counts:",
+            all_countries["has_data_any"].value_counts(dropna=False).to_dict(),
         )
-    except Exception as e:
-        st.write("streamlit_plotly_events import FAILED:", e)
-
-    st.write("plotly_events is None:", plotly_events is None)
-    st.write(
-        "AVAILABLE_INDICATORS:", AVAILABLE_INDICATORS,
-        "| has_data_any counts:",
-        all_countries["has_data_any"].value_counts(dropna=False).to_dict(),
-    )
-    st.write("plot_df[val] describe:", plot_df["val"].describe())
-
-
-    map_h = 800  # vertical height
-    scope_map = {
-        "World": "world",
-        "Africa": "africa",
-        "Asia": "asia",
-        "Europe": "europe",
-        "North America": "north america",
-        "South America": "south america",
-        "Oceania": "world",
-    }
-
-    fig = go.Figure(
-        go.Choropleth(
-            locations=plot_df["iso3"],
-            z=plot_df["val"],
-            locationmode="ISO-3",
-            colorscale=[[0.0, "#d4d4d8"], [1.0, "#12a39a"]],
-            zmin=0.0,
-            zmax=1.0,
-            autocolorscale=False,
-            showscale=False,
-            hoverinfo="text",
-            text=plot_df["hovertext"],
-            customdata=plot_df[["iso3"]].to_numpy(),
-            marker_line_width=1.6,
-            marker_line_color="rgba(0,0,0,0.70)",
+        st.write("plot_df[val] describe:", plot_df["val"].describe())
+    
+    
+        map_h = 800  # vertical height
+        scope_map = {
+            "World": "world",
+            "Africa": "africa",
+            "Asia": "asia",
+            "Europe": "europe",
+            "North America": "north america",
+            "South America": "south america",
+            "Oceania": "world",
+        }
+    
+        fig = go.Figure(
+            go.Choropleth(
+                locations=plot_df["iso3"],
+                z=plot_df["val"],
+                locationmode="ISO-3",
+                colorscale=[[0.0, "#d4d4d8"], [1.0, "#12a39a"]],
+                zmin=0.0,
+                zmax=1.0,
+                autocolorscale=False,
+                showscale=False,
+                hoverinfo="text",
+                text=plot_df["hovertext"],
+                customdata=plot_df[["iso3"]].to_numpy(),
+                marker_line_width=1.6,
+                marker_line_color="rgba(0,0,0,0.70)",
+            )
         )
-    )
-
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        height=map_h,
-        geo=dict(
-            scope=scope_map.get(st.session_state["region_scope"], "world"),
-            projection_type="natural earth",
-            showland=True,
-            landcolor="#f9fafb",
-            showcountries=True,
-            countrycolor="#9ca3af",
-            showocean=True,
-            oceancolor="#eff6ff",
-        ),
-    )
+    
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            height=map_h,
+            geo=dict(
+                scope=scope_map.get(st.session_state["region_scope"], "world"),
+                projection_type="natural earth",
+                showland=True,
+                landcolor="#f9fafb",
+                showcountries=True,
+                countrycolor="#9ca3af",
+                showocean=True,
+                oceancolor="#eff6ff",
+            ),
+        )
 
     # World view: slightly constrain lat so it doesn't look too zoomed out
     if st.session_state["region_scope"] == "World":
