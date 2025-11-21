@@ -682,25 +682,43 @@ if chosen and chosen != "— Type to search —":
 # -----------------------------------------------------------------------------
 # World map (bigger & full-bleed)
 # -----------------------------------------------------------------------------
+# World map (bigger & full-bleed)
+# -----------------------------------------------------------------------------
 st.markdown("### Country coverage overview")
 st.caption(
     "Shaded countries have at least one ADM0 climate indicator available in the database."
 )
 
-try:
-    st.write("DEBUG world map:",
-             "region_scope =", st.session_state.get("region_scope"),
-             "all_countries rows =", len(all_countries))
+# Filter to the region in the current selector
+region_isos = _isos_for_region(st.session_state["region_scope"], all_countries["iso3"])
+plot_df = all_countries[all_countries["iso3"].isin(region_isos)].copy()
 
-    region_isos = _isos_for_region(st.session_state["region_scope"], all_countries["iso3"])
-    plot_df = all_countries[all_countries["iso3"].isin(region_isos)].copy()
+# Optional debug line (you already used something like this)
+st.write(
+    f"DEBUG world map: region_scope = {st.session_state['region_scope']} "
+    f"rows = {len(plot_df)}"
+)
+
+if plot_df.empty:
+    st.info("No countries available for this region yet.")
+else:
     plot_df["hovertext"] = plot_df.apply(
-        lambda r: f"{r['name']}<br><span>Indicators: {r['badges']}</span>", axis=1
+        lambda r: f"{r['name']}<br><span>Indicators: {r['badges']}</span>",
+        axis=1,
     )
     plot_df["val"] = plot_df["has_data_any"].astype(float)
-    
-    map_h = 800  # increased map height for more vertical space
-    
+
+    map_h = 800  # vertical height
+    scope_map = {
+        "World": "world",
+        "Africa": "africa",
+        "Asia": "asia",
+        "Europe": "europe",
+        "North America": "north america",
+        "South America": "south america",
+        "Oceania": "world",
+    }
+
     fig = go.Figure(
         go.Choropleth(
             locations=plot_df["iso3"],
@@ -718,75 +736,87 @@ try:
             marker_line_color="rgba(0,0,0,0.70)",
         )
     )
-    
-    scope_map = {
-        "World": "world",
-        "Africa": "africa",
-        "Asia": "asia",
-        "Europe": "europe",
-        "North America": "north america",
-        "South America": "south america",
-        "Oceania": "world",
-    }
-    
+
     fig.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         height=map_h,
         geo=dict(
-            projection_type="robinson",
-            showframe=False,
-            showcoastlines=False,
-            showocean=False,
-            bgcolor="rgba(0,0,0,0)",
             scope=scope_map.get(st.session_state["region_scope"], "world"),
-            fitbounds="locations"
-            if st.session_state["region_scope"] != "World"
-            else None,
-            lataxis_range=[-60, 85]
-            if st.session_state["region_scope"] == "World"
-            else None,
+            projection_type="natural earth",
+            showland=True,
+            landcolor="#f9fafb",
+            showcountries=True,
+            countrycolor="#9ca3af",
+            showocean=True,
+            oceancolor="#eff6ff",
         ),
     )
-    
+
+    # World view: slightly constrain lat so it doesn't look too zoomed out
+    if st.session_state["region_scope"] == "World":
+        fig.update_geos(lataxis_range=[-60, 85])
+
+    # Full-bleed wrapper (same CSS you already have at the top)
     st.markdown('<div class="full-bleed">', unsafe_allow_html=True)
+
+    events = []
     if plotly_events is not None:
-        events = plotly_events(
-            fig,
-            click_event=True,
-            hover_event=False,
-            override_height=map_h,
-            override_width="100%",
-        )
+        # On Streamlit Cloud, this call can fail if the lib is missing or buggy.
+        # Wrap in try/except and fall back to a normal Plotly chart.
+        try:
+            events = plotly_events(
+                fig,
+                click_event=True,
+                hover_event=False,
+                override_height=map_h,
+                override_width="100%",
+            )
+        except Exception:
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+            events = []
     else:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
         events = []
+
     st.markdown("</div>", unsafe_allow_html=True)
-except Exception as e:
-    st.error(f"World map failed: {type(e).__name__}: {e}")
 
-clicked_iso3 = None
-if events:
-    e = events[0]
-    if isinstance(e, dict):
-        idx = e.get("pointIndex", None)
-        if idx is not None and 0 <= idx < len(plot_df):
-            clicked_iso3 = str(plot_df.iloc[idx]["iso3"]).upper()
+    # Handle click-to-open for countries (if we got events from plotly_events)
+    clicked_iso3 = None
+    if events:
+        e = events[0]
+        if isinstance(e, dict):
+            idx = e.get("pointIndex", None)
+            if idx is not None and 0 <= idx < len(plot_df):
+                clicked_iso3 = str(plot_df.iloc[idx]["iso3"]).upper()
 
-if clicked_iso3 and clicked_iso3 in iso_with_data:
-    _log_event(
-        "map_click_open",
-        {
+    if clicked_iso3 and clicked_iso3 in iso_with_data:
+        _log_event(
+            "map_click_open",
+            {
+                "iso3": clicked_iso3,
+                "indicator": st.session_state.get(
+                    "default_indicator", "Temperature"
+                ),
+            },
+        )
+        st.session_state["_pending_nav"] = {
             "iso3": clicked_iso3,
-            "indicator": st.session_state.get("default_indicator", "Temperature"),
-        },
-    )
-    st.session_state["_pending_nav"] = {
-        "iso3": clicked_iso3,
-        "indicator": st.session_state.get("default_indicator", "Temperature"),
-    }
-    st.rerun()
+            "indicator": st.session_state.get(
+                "default_indicator", "Temperature"
+            ),
+        }
+        st.rerun()
+
 
 # -----------------------------------------------------------------------------
 # Global snapshot section
