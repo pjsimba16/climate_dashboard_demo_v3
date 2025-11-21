@@ -3,6 +3,8 @@
 import os, math
 from typing import List, Tuple, Optional, Dict
 from pathlib import Path
+import io                         
+import requests                   
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -10,6 +12,7 @@ from plotly.subplots import make_subplots
 import plotly.express as px
 import streamlit as st
 from huggingface_hub import hf_hub_download, list_repo_files
+
 
 # Try plotly-resampler (optional)
 try:
@@ -74,7 +77,7 @@ _CUSTOM = {"CHN":"People's Republic of China","TWN":"Taipei, China","HKG":"Hong 
 def display_country_name(iso:str)->str: return _CUSTOM.get((iso or "").upper().strip(), iso3_to_name(iso))
 
 # =================== BACKEND SELECTOR ===================
-DATA_BACKEND_OVERRIDE = "auto"  # "local" | "hf" | "auto"
+DATA_BACKEND_OVERRIDE = "hf"  # "local" | "hf" | "auto"
 
 def _secret_or_env(k, default=""):
     try:
@@ -85,6 +88,42 @@ def _secret_or_env(k, default=""):
 HF_REPO_ID   = _secret_or_env("HF_REPO_ID","pjsimba16/adb-climate-data")
 HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE","space")  # space per your note
 HF_TOKEN     = _secret_or_env("HF_TOKEN","") or None
+
+# --- HF SPACE HELPERS (Custom Chart via HF space, not local) -------------------
+HF_SPACE_BASE = "https://huggingface.co/spaces/pjsimba16/adb-climate-data/resolve/main"
+
+def _note_err(msg: str) -> None:
+    """Collect HF/IO errors so they can be inspected if needed."""
+    st.session_state.setdefault("hf_errors", []).append(str(msg))
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def _read_parquet_from_space(rel_path: str,
+                             columns: Optional[List[str]] = None) -> Optional[pd.DataFrame]:
+    """
+    Read a parquet file from the HF Space using HTTPS, with basic error handling.
+    `rel_path` is like "country_data/PHL/Monthly/PHL_ADM0_data.parquet".
+    """
+    url = f"{HF_SPACE_BASE}/{rel_path.lstrip('/')}"
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+    except Exception as e:  # pragma: no cover
+        _note_err(f"HF download failed for {rel_path}: {e}")
+        return None
+
+    try:
+        # Pass columns directly; pandas supports this on BytesIO
+        return pd.read_parquet(io.BytesIO(resp.content), columns=columns)
+    except Exception as e:  # pragma: no cover
+        try:
+            # Fallback: read everything then subset
+            df = pd.read_parquet(io.BytesIO(resp.content))
+            if columns is not None:
+                df = df[[c for c in columns if c in df.columns]]
+            return df
+        except Exception as e2:
+            _note_err(f"Parquet read failed for {rel_path}: {e2}")
+            return None
 
 def _resolve_backend() -> str:
     ov = str(DATA_BACKEND_OVERRIDE or "").lower()
@@ -117,13 +156,39 @@ def _dl(relpath:str)->str:
 # =================== ADM1 LIST (from mapper CSV one level up) ===================
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _load_city_map() -> pd.DataFrame:
-    for fname in ["city_mapper_with_coords_v3.csv","city_mapper_with_coords_v2.csv"]:
-        p = ROOT / fname
-        if p.exists():
-            try: return pd.read_csv(p)
-            except Exception: pass
-    # fall back empty
+    """
+    Load ADM1 mapper from the HF space (city_mapper_with_coords_v3/2.csv).
+    """
+    candidates = [
+        "city_mapper_with_coords_v3.csv",
+        "city_mapper_with_coords_v2.csv",
+    ]
+    for rel in candidates:
+        url = f"{HF_SPACE_BASE}/{rel.lstrip('/')}"
+        try:
+            resp = requests.get(url)
+            resp.raise_for_status()
+        except Exception as e:
+            _note_err(f"HF download failed for {rel}: {e}")
+            continue
+        try:
+            df = pd.read_csv(io.StringIO(resp.content.decode("utf-8")))
+        except Exception as e:
+            _note_err(f"CSV parse failed for {rel}: {e}")
+            continue
+
+        # We only need Country/City columns for ADM1 list here
+        cn_country = next((c for c in df.columns if c.lower() == "country"), None)
+        cn_city    = next((c for c in df.columns if c.lower() == "city"), None)
+        if not (cn_country and cn_city):
+            _note_err(f"{rel} missing Country/City columns.")
+            continue
+
+        df = df.rename(columns={cn_country: "Country", cn_city: "City"})
+        return df[["Country","City"]].copy()
+
     return pd.DataFrame(columns=["Country","City"])
+
 
 CITY_MAP = _load_city_map()
 ADM1_ALL = (CITY_MAP.rename(columns={"Country":"ADM0","City":"ADM1"})[["ADM0","ADM1"]]
@@ -132,13 +197,41 @@ ADM1_ALL["ADM0"] = ADM1_ALL["ADM0"].str.upper().str.strip()
 ADM1_ALL["ADM1"] = ADM1_ALL["ADM1"].str.strip()
 ADM1_CHOICES = sorted(ADM1_ALL.drop_duplicates().itertuples(index=False, name=None))
 
+def _canonical_type(t: str) -> str:
+    t = (t or "").strip().lower()
+    if t in {"temperature","temp"}:
+        return "Temperature"
+    if t in {"precipitation","rain","precip","pcp"}:
+        return "Precipitation"
+    if t in {"humidity","humid"}:
+        return "Humidity"
+    if t in {"wind","windspeed","wind speeds","wind speed"}:
+        return "Wind speeds"
+    return (t or "").strip().title()
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def _load_availability_snapshot() -> pd.DataFrame:
+    df = _read_parquet_from_space("availability_snapshot.parquet")
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["iso3","indicator_type"])
+    df = df.copy()
+    col_map = {c.lower(): c for c in df.columns}
+    iso_col  = col_map.get("iso3") or col_map.get("iso")
+    type_col = col_map.get("indicator_type") or col_map.get("type")
+    if not iso_col or not type_col:
+        return pd.DataFrame(columns=["iso3","indicator_type"])
+    df[iso_col]  = df[iso_col].astype(str).str.upper().str.strip()
+    df[type_col] = df[type_col].astype(str).map(_canonical_type)
+    return pd.DataFrame({"iso3": df[iso_col], "indicator_type": df[type_col]})
+
+
 # =================== AVAILABILITY (scan local or HF) ===================
 MAIN_CODES = {"Temperature":"TMPA","Precipitation":"PCPA","Humidity":"HUMA","Wind speeds":"WSPA"}
 
 def _suffixes(level: str, freq: str) -> List[str]:
     # level: "ADM0" or "ADM1"
     if freq=="Annual":
-        return ["_A"]
+        return ["_AA"] if level=='ADM0' else ["_A"]
     if freq=="Monthly":
         return ["_AM","_PM","_M"] if level=="ADM0" else ["_M"]
     if freq=="Seasonal":
@@ -166,35 +259,46 @@ def _list_hf_isos() -> List[str]:
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def available_isos() -> List[str]:
-    if DATA_BACKEND in ("hf","auto"):
-        h = _list_hf_isos()
-        if h: return h
-    return _list_local_isos()
+    """
+    Use availability_snapshot from the HF space instead of scanning repos.
+    Return all ISO3s that have any of the 4 core indicators (Temp/Precip/Humidity/Windspeeds).
+    """
+    snap = _load_availability_snapshot()
+    if snap is None or snap.empty:
+        return []
+    mask = snap["indicator_type"].isin(["Temperature","Precipitation","Humidity","Wind speeds"])
+    return sorted(snap.loc[mask, "iso3"].astype(str).unique().tolist())
+
 
 ALL_ISOS = available_isos()
 ISO_NAME_MAP = {iso:display_country_name(iso) for iso in ALL_ISOS}
 
 # =================== BUILD DATES ===================
 def _to_date_from_parts(df: pd.DataFrame, freq: str) -> pd.Series:
-    if freq=="Monthly":
-        y = pd.to_numeric(df["Year"], errors="coerce")
-        m = pd.to_numeric(df["Month"], errors="coerce")
+    if freq == "Monthly":
+        y = pd.to_numeric(df.get("Year"),  errors="coerce")
+        m = pd.to_numeric(df.get("Month"), errors="coerce")
         return pd.to_datetime(dict(year=y, month=m, day=1), errors="coerce")
-    if freq=="Seasonal":
-        if "Year" in df.columns and "Season" in df.columns:
-            y = pd.to_numeric(df["Year"], errors="coerce")
-            s = df["Season"].astype(str).str.upper().str.extract(r"Q(\d)", expand=False).astype(float)
-            s = s.where(s.isin([1,2,3,4]), np.nan)
-            month = s.map({1:1,2:4,3:7,4:10})
-            return pd.to_datetime(dict(year=y, month=month, day=1), errors="coerce")
-        else:
-            s = df["Season"].astype(str)
-            year = s.str.extract(r"(\d{4})", expand=False).astype(float)
-            q = s.str.extract(r"Q([1-4])", expand=False).astype(float)
-            month = q.map({1:1,2:4,3:7,4:10})
-            return pd.to_datetime(dict(year=year, month=month, day=1), errors="coerce")
-    y = pd.to_numeric(df["Year"], errors="coerce")
+
+    if freq == "Seasonal":
+        year = pd.to_numeric(df.get("Year"), errors="coerce")
+        season = df.get("Season")
+        if season is None:
+            return pd.Series([pd.NaT] * len(df))
+        s2m = {"DJF": 2, "MAM": 5, "JJA": 8, "SON": 11}
+        mo = (
+            season.astype(str)
+            .str.upper()
+            .map(s2m)
+            .astype("float")
+        )
+        return pd.to_datetime(dict(year=year, month=mo, day=1), errors="coerce")
+
+    # Annual
+    y = pd.to_numeric(df.get("Year"), errors="coerce")
     return pd.to_datetime(dict(year=y, month=1, day=1), errors="coerce")
+
+
 
 # =================== FILE HELPERS ===================
 def _adm0_fp_local(iso: str, freq: str) -> Path:
@@ -227,16 +331,12 @@ def _read_parquet_local(path: Path, columns: Optional[List[str]]=None) -> Option
         except Exception:
             return None
 
-def _read_parquet_hf(relpath: str, columns: Optional[List[str]]=None) -> Optional[pd.DataFrame]:
-    try:
-        p = _dl(relpath)
-        return pd.read_parquet(p, columns=columns)
-    except Exception:
-        try:
-            p = _dl(relpath)
-            return pd.read_parquet(p)
-        except Exception:
-            return None
+def _read_parquet_hf(relpath: str, columns: Optional[List[str]] = None) -> Optional[pd.DataFrame]:
+    """
+    Wrapper that reads parquet from the HF Space via HTTPS, with caching.
+    """
+    return _read_parquet_from_space(relpath, columns=columns)
+
 
 def _read_frame(level: str, iso: str, freq: str, adm1: Optional[str]) -> Optional[pd.DataFrame]:
     if level=="ADM0":
@@ -256,28 +356,58 @@ def _single_series(level: str, iso: str, freq: str, code: str, adm1: Optional[st
       level, iso3, adm1, date, <code_lower>
     """
     df = _read_frame(level, iso, freq, adm1)
+    empty = pd.DataFrame(columns=["level", "iso3", "adm1", "date", code.lower()])
+
     if df is None or df.empty:
-        return pd.DataFrame(columns=["level","iso3","adm1","date",code.lower()])
+        return empty
+
     df = df.copy()
-    needed_time = {"Monthly":["Year","Month"], "Seasonal":["Season"], "Annual":["Year"]}[freq]
-    for c in needed_time:
-        if c not in df.columns:
-            if not (freq=="Seasonal" and c=="Year"):
-                return pd.DataFrame(columns=["level","iso3","adm1","date",code.lower()])
-    sfx = _suffixes("ADM0" if level=="ADM0" else "ADM1", freq)
+
+    # --- normalize time columns (case-insensitive) ---
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    if freq == "Monthly":
+        year_col  = cols_lower.get("year")
+        month_col = cols_lower.get("month")
+        if not year_col or not month_col:
+            return empty
+        df = df.rename(columns={year_col: "Year", month_col: "Month"})
+
+    elif freq == "Seasonal":
+        season_col = cols_lower.get("season")
+        if not season_col:
+            return empty
+        df = df.rename(columns={season_col: "Season"})
+        year_col = cols_lower.get("year")
+        if year_col:
+            df = df.rename(columns={year_col: "Year"})
+
+    else:  # Annual
+        year_col = cols_lower.get("year")
+        if not year_col:
+            return empty
+        df = df.rename(columns={year_col: "Year"})
+
+    # --- pick the indicator column ---
+    sfx = _suffixes("ADM0" if level == "ADM0" else "ADM1", freq)
     col = _pick_col(list(df.columns), code, sfx)
     if not col:
-        return pd.DataFrame(columns=["level","iso3","adm1","date",code.lower()])
+        return empty
+
+    # --- build date and output ---
     dt = _to_date_from_parts(df, freq)
-    out = pd.DataFrame({
-        "level": level,
-        "iso3": iso,
-        "adm1": (adm1 or ""),
-        "date": dt,
-        code.lower(): pd.to_numeric(df[col], errors="coerce")
-    })
+    out = pd.DataFrame(
+        {
+            "level": level,
+            "iso3": iso,
+            "adm1": (adm1 or ""),
+            "date": dt,
+            code.lower(): pd.to_numeric(df[col], errors="coerce"),
+        }
+    )
     out = out.dropna(subset=["date"]).sort_values("date")
     return out
+
 
 # =================== HIGH-LEVEL BUILDERS ===================
 def _build_country_series(iso: str, freq: str) -> pd.DataFrame:
@@ -354,42 +484,16 @@ chart_type = st.segmented_control(
 )
 
 # =================== GLOBAL DATE FALLBACK ===================
-@st.cache_data(ttl=24*3600, show_spinner=False)
 def _global_minmax(freq: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
     """
-    Find global min/max dates across ADM0 for any of the 4 main indicators.
+    Very cheap fallback: do NOT scan all ADM0 files.
+    We just expose a wide static range; actual data will be filtered
+    later after the user clicks 'Generate Chart(s)'.
     """
-    def _find_any_col(cols: List[str], freq: str) -> Optional[str]:
-        for code in ["TMPA","PCPA","HUMA","WSPA"]:
-            col = _pick_col(cols, code, _suffixes("ADM0", freq))
-            if col: return col
-        return None
+    dmin = pd.Timestamp("1980-01-01")
+    dmax = pd.Timestamp.today().normalize()
+    return (dmin, dmax)
 
-    dmins, dmaxs = [], []
-    for iso in ALL_ISOS:
-        f = _adm0_fp_local(iso, freq)
-        df = _read_parquet_local(f) if f.exists() else None
-        if df is None and DATA_BACKEND in ("hf","auto"):
-            df = _read_parquet_hf(_adm0_fp_hf(iso, freq))
-        if df is None or df.empty:
-            continue
-
-        col = _find_any_col(list(df.columns), freq)
-        if not col:
-            continue
-        try:
-            df2 = df.copy()
-            df2["Date"] = _to_date_from_parts(df2, freq)
-            df2 = df2.dropna(subset=["Date"])
-            if not df2.empty:
-                dmins.append(df2["Date"].min())
-                dmaxs.append(df2["Date"].max())
-        except Exception:
-            continue
-
-    if dmins and dmaxs:
-        return (min(dmins), max(dmaxs))
-    return (pd.Timestamp("1980-01-01"), pd.Timestamp.today().normalize())
 
 # =================== OPTIONS ===================
 with st.expander("Options", expanded=True):
@@ -401,7 +505,7 @@ with st.expander("Options", expanded=True):
         sel_countries = st.multiselect(
             "Countries (optional)", options=iso_opts, format_func=lambda x: ISO_NAME_MAP.get(x,x),
         )
-        def _adm1label(pair): return f"{display_country_name(pair[0])} — {pair[1]}"
+        def _adm1label(pair): return f"{display_country_name(pair[0])} - {pair[1]}"
         sel_adm1 = st.multiselect(
             "ADM1 (optional)", options=ADM1_CHOICES, format_func=_adm1label,
         )
@@ -411,39 +515,29 @@ with st.expander("Options", expanded=True):
             "Frequency", ["Monthly","Seasonal","Annual"], index=0, horizontal=True,
         )
 
-        # Date bounds (GLOBAL FALLBACK now ensures sliders always visible)
-        @st.cache_data(ttl=1200, show_spinner=False)
-        def _minmax_from_selection(countries: Tuple[str,...], adm1s: Tuple[Tuple[str,str],...], freq: str) -> Tuple[pd.Timestamp, pd.Timestamp]:
-            frames=[]
-            for iso in countries or ():
-                frames.append(_build_country_series(iso, freq))
-            if adm1s:
-                by_iso = {}
-                for iso, name in adm1s:
-                    by_iso.setdefault(iso, set()).add(name)
-                for iso, names in by_iso.items():
-                    frames.append(_build_adm1_series_for_country(iso, freq, only_pairs=[(iso,n) for n in names]))
-            if not frames:
-                return _global_minmax(freq)
-            all_dates = pd.concat([f["date"] for f in frames if not f.empty], ignore_index=True)
-            if all_dates.empty:
-                return _global_minmax(freq)
-            return (all_dates.min(), all_dates.max())
-
-        dmin, dmax = _minmax_from_selection(tuple(sel_countries), tuple(sel_adm1), freq)
+        # Date bounds: DO NOT load any data here.
+        # Use a wide static range; actual data gets filtered after submit.
+        dmin, dmax = _global_minmax(freq)  # now cheap: just 1980 -> today
 
         # Quick select + slider ALWAYS shown
-        quick = st.segmented_control("Quick select", options=["10y","20y","30y","50y","All"], selection_mode="single", key="quick_sel")
-        q_years = {"10y":10,"20y":20,"30y":30,"50y":50}.get(quick, None)
+        quick = st.segmented_control(
+            "Quick select",
+            options=["10y", "30y", "50y", "All"],
+            selection_mode="single",
+            key="quick_sel",
+        )
+        q_years = {"10y": 10, "30y": 30, "50y": 50}.get(quick, None)
         default_start = (dmax - pd.DateOffset(years=q_years)).date() if q_years else dmin.date()
         default_start = max(default_start, dmin.date())
 
         dstart, dend = st.slider(
             "Custom range",
-            min_value=dmin.date(), max_value=dmax.date(),
+            min_value=dmin.date(),
+            max_value=dmax.date(),
             value=(default_start, dmax.date()),
             format="YYYY-MM",
         )
+
 
         st.markdown("---")
         facet_by = st.selectbox("Facet", ["None","Geography (Country/ADM1)","Indicator"], index=0)
@@ -476,38 +570,32 @@ with st.expander("Options", expanded=True):
             with st.expander("Advanced (scatter)"):
                 global_window = st.number_input("Smoothing window for connecting lines (0 = off)", min_value=0, value=0, step=1)
 
-        else:  # Anomaly
+        elif chart_type=="Anomaly":
             an_indicator = st.selectbox("Indicator", IND_OPTIONS, index=0)
 
-            @st.cache_data(ttl=1200, show_spinner=False)
-            def _baseline_bounds(freq: str, countries: Tuple[str, ...], adm1s: Tuple[Tuple[str, str], ...]) -> Tuple[int, int]:
-                frames=[]
-                for iso in countries or ():
-                    frames.append(_build_country_series(iso, freq))
-                if adm1s:
-                    by_iso={}
-                    for iso,name in adm1s:
-                        by_iso.setdefault(iso,set()).add(name)
-                    for iso, names in by_iso.items():
-                        frames.append(_build_adm1_series_for_country(iso, freq, only_pairs=[(iso,n) for n in names]))
-                if not frames:
-                    gmin,gmax=_global_minmax(freq)
-                    return (gmin.year, gmax.year)
-                all_dates = pd.concat([f["date"] for f in frames if not f.empty], ignore_index=True)
-                if all_dates.empty:
-                    gmin,gmax=_global_minmax(freq)
-                    return (gmin.year, gmax.year)
-                return (all_dates.dt.year.min().item(), all_dates.dt.year.max().item())
+            # Baseline year bounds: cheap static range, no data loading here.
+            this_year = pd.Timestamp.today().year
+            bmin, bmax = 1980, this_year
 
-            bmin, bmax = _baseline_bounds(freq, tuple(sel_countries), tuple(sel_adm1))
-            base_start, base_end = st.slider("Baseline years", min_value=int(bmin), max_value=int(bmax),
-                                             value=(max(int(bmin),1991), min(int(bmax),2020)))
-            baseline_calc = st.selectbox("Baseline calculation method", ["Mean","Median","Min","Max"])
-            an_method  = st.selectbox("Anomaly calculation method",
-                                      ["Absolute (value - baseline)", "Percent of baseline", "Z-score (std from baseline)"])
+            base_start, base_end = st.slider(
+                "Baseline years",
+                min_value=int(bmin),
+                max_value=int(bmax),
+                value=(max(int(bmin), 1991), min(int(bmax), 2020)),
+            )
+
+            baseline_calc = st.selectbox(
+                "Baseline calculation method",
+                ["Mean", "Median", "Min", "Max"],
+            )
+            an_method  = st.selectbox(
+                "Anomaly calculation method",
+                ["Absolute (value - baseline)", "Percent of baseline", "Z-score (std from baseline)"],
+            )
             with st.expander("Advanced (anomalies)"):
                 clim_overlay = st.checkbox("Overlay baseline (=0) line", value=True)
                 show_points   = st.checkbox("Show markers (anomaly)", value=False)
+
 
         submitted = st.form_submit_button("Generate Chart(s)", use_container_width=True)
 
@@ -522,32 +610,63 @@ def _ind_to_col_and_label(name: str) -> Tuple[str, str]:
     if name.startswith("Humidity"): return ("huma", "Humidity (%)")
     return ("wspa", "Wind speeds (m/s)")
 
-@st.cache_data(ttl=900, show_spinner=False)
 def _assemble_data(countries: Tuple[str,...],
                    adm1s: Tuple[Tuple[str,str],...],
                    freq: str,
                    start_date: str,
                    end_date: str) -> pd.DataFrame:
     """
-    Assemble and FILTER data by [start_date, end_date] explicitly so cache
-    invalidates when slider moves.
+    Assemble and FILTER data by [start_date, end_date].
+    Shows a progress bar over countries and ADM1 bundles.
     """
-    frames=[]
+    frames = []
+
+    # Build a list of tasks: one per country ADM0 + one per iso’s ADM1 set
+    tasks: List[Tuple[str, str, Optional[List[Tuple[str,str]]]]] = []
+
     for iso in countries or ():
-        frames.append(_build_country_series(iso, freq))
-    if adm1s:
-        by_iso={}
-        for iso,name in adm1s:
-            by_iso.setdefault(iso,set()).add(name)
-        for iso, names in by_iso.items():
-            frames.append(_build_adm1_series_for_country(iso, freq, only_pairs=[(iso,n) for n in names]))
+        tasks.append(("ADM0", iso, None))
+
+    by_iso: Dict[str, set] = {}
+    for iso, name in adm1s or ():
+        by_iso.setdefault(iso, set()).add(name)
+    for iso, names in by_iso.items():
+        tasks.append(("ADM1", iso, [(iso, n) for n in names]))
+
+    if not tasks:
+        return pd.DataFrame(columns=["level","iso3","adm1","date","tmpa","pcpa","huma","wspa"])
+
+    progress = st.progress(0, text="Loading data…")
+    total = len(tasks)
+
+    for i, (lvl, iso, pair_list) in enumerate(tasks, start=1):
+        if lvl == "ADM0":
+            frames.append(_build_country_series(iso, freq))
+            label = f"{iso} ADM0"
+        else:
+            frames.append(
+                _build_adm1_series_for_country(
+                    iso, freq, only_pairs=pair_list
+                )
+            )
+            adm1_names = ", ".join(sorted({p[1] for p in pair_list}))
+            label = f"{iso} ADM1: {adm1_names}"
+
+        frac = i / total
+        progress.progress(frac, text=f"Loading {i}/{total}: {label}")
+
+    progress.empty()
+
+    frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame(columns=["level","iso3","adm1","date","tmpa","pcpa","huma","wspa"])
+
     df = pd.concat(frames, ignore_index=True)
     sd = pd.to_datetime(start_date)
     ed = pd.to_datetime(end_date)
-    mask = (df["date"]>=sd) & (df["date"]<=ed)
+    mask = (df["date"] >= sd) & (df["date"] <= ed)
     return df.loc[mask].sort_values(["level","iso3","adm1","date"]).reset_index(drop=True)
+
 
 with st.spinner("Preparing chart data…"):
     WIDE = _assemble_data(tuple(sel_countries),
@@ -562,12 +681,42 @@ with st.spinner("Preparing chart data…"):
 def _apply_smooth(s:pd.Series, win:int)->pd.Series:
     return s.rolling(win, min_periods=1, center=True).mean() if (win and win>0) else s
 
-geos = WIDE[["level","iso3","adm1"]].drop_duplicates().reset_index(drop=True)
-def _geo_key(level, iso3, adm1): return f"{level}|{iso3}|{adm1 if level=='adm1' else ''}"
-_GEO_IDX = {_geo_key(r.level, r.iso3, r.adm1): i for i,(_,r) in enumerate(geos.iterrows())}
+geos = WIDE[["level", "iso3", "adm1"]].drop_duplicates().reset_index(drop=True)
 
-def _trace_base_name(row)->str:
-    return f"{display_country_name(row['iso3'])} — {row['adm1']}" if row["level"]=="adm1" and row["adm1"] else display_country_name(row["iso3"])
+def _geo_key(level, iso3, adm1):
+    """
+    Unique key per geo for coloring:
+      - ADM0: 'adm0|ISO'
+      - ADM1: 'adm1|ISO|ADM1'
+    """
+    lvl = str(level).lower()
+    iso = str(iso3).upper()
+    if lvl == "adm1":
+        return f"adm1|{iso}|{adm1}"
+    return f"adm0|{iso}|"
+
+_GEO_IDX = {
+    _geo_key(r.level, r.iso3, r.adm1): i
+    for i, (_, r) in enumerate(geos.iterrows())
+}
+
+def _label_geo(level, iso3, adm1):
+    """
+    Label for a geography:
+      - ADM0: 'Country name'
+      - ADM1: 'Country name — ADM1 name'
+    """
+    base = display_country_name(iso3)
+    lvl  = str(level).upper()
+    if lvl == "ADM1" and adm1:
+        return f"{base} - {adm1}"
+    return base
+
+def _trace_base_name(row) -> str:
+    """
+    Base name for a trace, using the same logic as _label_geo.
+    """
+    return _label_geo(row.get("level"), row.get("iso3"), row.get("adm1"))
 
 trace_names=[]
 if chart_type in ("Line","Area","Bar"):
@@ -578,7 +727,7 @@ if chart_type in ("Line","Area","Bar"):
             trace_names.append(base)
         else:
             for ind in chosen:
-                trace_names.append(f"{base} — {ind.split()[0]}")
+                trace_names.append(f"{base} - {ind.split()[0]}")
 
 per_trace_windows: Dict[str,int] = {}
 if (locals().get("enable_per_trace") and trace_names):
@@ -623,9 +772,23 @@ def _add_ts(fig, df_geo, row, col, name, ycol, secondary=False, markers=False, i
         fig.data[-1].update(marker_color=_color(idx))
     else:
         mode = "lines+markers" if markers else "lines"
-        tr = go.Scatter(x=df_geo["date"], y=df_geo[ycol], mode=mode, name=name, line=dict(width=2))
+        tr = go.Scatter(
+            x=df_geo["date"],
+            y=df_geo[ycol],
+            mode=mode,
+            name=name,
+            line=dict(width=2),
+            hovertemplate=(
+                f"<b>{name}</b><br>"
+                "Date: %{x|%Y-%m-%d}<br>"
+                "Value: %{y:.2f}<extra></extra>"
+            ),
+        )
         fig.add_trace(tr, row=row, col=col, secondary_y=secondary)
-        fig.data[-1].update(line=dict(color=_color(idx), width=2), marker_color=_color(idx))
+        fig.data[-1].update(line=dict(color=_color(idx), width=2),
+                            marker_color=_color(idx))
+
+
 
 def _add_xy(fig, df_geo, row, col, name, xcol, ycol, markers=False, idx=0):
     tr = go.Scatter(x=df_geo[xcol], y=df_geo[ycol],
@@ -638,7 +801,17 @@ def _add_xy(fig, df_geo, row, col, name, xcol, ycol, markers=False, idx=0):
 
 # =================== TITLE ===================
 def _label_geo(level, iso3, adm1):
-    base=display_country_name(iso3); return f"{base} — {adm1}" if level=="adm1" and adm1 else base
+    """
+    Label for a geography:
+      - ADM0: 'Country name'
+      - ADM1: 'Country name — ADM1 name'
+    """
+    base = display_country_name(iso3)
+    lvl  = str(level).upper()
+    if lvl == "ADM1" and adm1:
+        return f"{base} — {adm1}"
+    return base
+
 
 def _compose_title(indicators:List[str], countries:List[str], adm1_pairs:List[Tuple[str,str]])->str:
     inds=" & ".join(indicators) if indicators else ""
@@ -648,7 +821,7 @@ def _compose_title(indicators:List[str], countries:List[str], adm1_pairs:List[Tu
         df=pd.DataFrame(adm1_pairs, columns=["iso3","adm1"])
         chunks=[f"{display_country_name(iso)} ({', '.join(g['adm1'].tolist())})" for iso,g in df.groupby("iso3")]
         parts.append("ADM1: " + "; ".join(chunks))
-    bits=[b for b in [inds]+parts if b]; return " — ".join(bits)
+    bits=[b for b in [inds]+parts if b]; return " - ".join(bits)
 
 inds_list = (
     [locals().get("x_series"), locals().get("y_series")] if chart_type=="Scatter"
@@ -666,7 +839,7 @@ def _apply_smoothing_block(df: pd.DataFrame, indicators: List[str], gw: int, per
         for ind in indicators:
             col, lab = _ind_to_col_and_label(ind)
             if col not in gg: continue
-            nm = base if len(indicators)==1 else f"{base} — {ind.split()[0]}"
+            nm = base if len(indicators)==1 else f"{base} - {ind.split()[0]}"
             win = per_trace.get(nm, gw)
             gg[col] = _apply_smooth(gg[col], win)
         out.append(gg)
@@ -763,7 +936,7 @@ else:
             for ind in chosen:
                 ycol, lab = _ind_to_col_and_label(ind)
                 if ycol not in df or df[ycol].dropna().empty: continue
-                nm = base if len(chosen)==1 else f"{base} — {ind.split()[0]}"
+                nm = base if len(chosen)==1 else f"{base} - {ind.split()[0]}"
                 _add_ts(fig, df, r, c, nm, ycol, secondary=False, markers=show_points, is_bar=(chart_type=="Bar"), idx=k)
         ylab = ( _ind_to_col_and_label(chosen[0])[1] if len(chosen)==1 else None )
         _apply_layout(fig, title_txt, "Date", ylab, not hide_title, (chart_type=="Bar"), False, False)
@@ -880,4 +1053,3 @@ try:
                        file_name="custom_chart.png", mime="image/png")
 except Exception:
     pass
-
