@@ -784,7 +784,7 @@ else:
     # Full-bleed wrapper (same CSS you already have at the top)
     st.markdown('<div class="full-bleed">', unsafe_allow_html=True)
 
-    st.write("DEBUG: map click events:", events)
+    
 
 
     events = []
@@ -815,6 +815,8 @@ else:
         events = []
 
     st.markdown("</div>", unsafe_allow_html=True)
+
+    st.write("DEBUG: map click events:", events)
 
     # Handle click-to-open for countries (if we got events from plotly_events)
     clicked_iso3 = None
