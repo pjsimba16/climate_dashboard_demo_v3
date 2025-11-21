@@ -7,7 +7,7 @@
 # - Percentiles: one percentile radio + one ADM1 multiselect for all three charts
 # - Legend horizontal; hover shows Date, then per-ADM1 blocks
 
-import os, re, unicodedata
+import os, re, unicodedata, io 
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -15,81 +15,218 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import geopandas as gpd
+import requests           
 
-# === Data backend selector (local | hf | auto) ===
+# For territory insets (USA, FRA, ESP, PRT, DNK, NOR, CHN)
 try:
-    from huggingface_hub import hf_hub_download, list_repo_files
+    from shapely.affinity import translate as shp_translate
+except Exception:
+    from shapely import affinity as _shp_affinity
+
+    def shp_translate(geom, xoff=0.0, yoff=0.0):
+        return _shp_affinity.translate(geom, xoff=xoff, yoff=yoff)
+
+
+try:
+    from huggingface_hub import hf_hub_download
 except Exception:
     hf_hub_download = None
-    list_repo_files = None
 
-def _secret_or_env(k, default=""):
-    try:
-        if hasattr(st, "secrets") and k in st.secrets:
-            return st.secrets[k]
-    except Exception:
-        pass
-    return os.getenv(k, default)
+def _name_matches(name: str, candidates: list[str]) -> bool:
+    n = (str(name) or "").strip().lower()
+    return any(n == c.strip().lower() or n.endswith(c.strip().lower()) for c in candidates)
 
-DATA_BACKEND_OVERRIDE = os.getenv("DATA_BACKEND", "auto")  # "local" | "hf" | "auto"
-HF_REPO_ID   = _secret_or_env("HF_REPO_ID",   "pjsimba16/adb-climate-data")
-HF_REPO_TYPE = _secret_or_env("HF_REPO_TYPE", "space")      # "space" or "dataset"
-HF_TOKEN     = _secret_or_env("HF_TOKEN",     "")
 
-def _resolve_backend() -> str:
-    # allow ?backend=hf in URL, or st.secrets["DATA_BACKEND"], or env var
-    qp = {}
-    try:
-        qp = st.query_params
-    except Exception:
-        pass
-    if qp:
-        b = str(qp.get("backend", [""])[0]).lower()
-        if b in ("local","hf","auto"): return b
-    if hasattr(st, "secrets"):
-        v = str(st.secrets.get("DATA_BACKEND","auto")).lower()
-        if v in ("local","hf","auto"): return v
-    ov = str(DATA_BACKEND_OVERRIDE or "auto").lower()
-    return ov if ov in ("local","hf","auto") else "auto"
-
-DATA_BACKEND = _resolve_backend()
-ROOT = Path(__file__).resolve().parents[1]  # project root (…/app)
-COUNTRY_DATA_DIR = next((p for p in [
-    ROOT / "country_data",
-    Path.cwd() / "country_data",
-    Path("/mnt/data/country_data"),
-] if p.exists()), ROOT / "country_data")
-
-def _rel_from_country_data(p: Path) -> str:
-    # convert local file path to "country_data/ISO/Freq/…parquet"
-    try:
-        return "country_data/" + str(p.relative_to(COUNTRY_DATA_DIR)).replace("\\","/")
-    except Exception:
-        return None
-
-def _read_parquet_local(p: Path, columns=None):
-    return pd.read_parquet(p, columns=columns)  # let it raise if missing
-
-def _read_parquet_hf(relpath: str, columns=None):
-    if hf_hub_download is None:
-        raise FileNotFoundError("huggingface_hub not available.")
-    fp = hf_hub_download(repo_id=HF_REPO_ID, repo_type=HF_REPO_TYPE,
-                         filename=relpath, token=HF_TOKEN)
-    return pd.read_parquet(fp, columns=columns)
-
-def read_parquet_smart(p: Path, columns=None):
+def _composite_adm1_layout(iso3: str, gdf: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame":
     """
-    Tries local first (if backend=local or auto+exists). Otherwise loads from HF.
-    'p' must be a path under COUNTRY_DATA_DIR.
+    Re-arrange far-flung territories closer to the mainland for nicer choropleth maps.
+    Logic copied from the original 1_Temperature_Dashboard_v0.py.
+
+    Applies to: USA, FRA, ESP, PRT, DNK, NOR, CHN.
+    For other ISO3 codes, returns gdf unchanged.
     """
-    use = DATA_BACKEND
-    if use in ("local","auto") and p.exists():
-        return _read_parquet_local(p, columns=columns)
-    rel = _rel_from_country_data(p)
-    if use in ("hf","auto") and rel:
-        return _read_parquet_hf(rel, columns=columns)
-    # last attempt: local (to surface the original error)
-    return _read_parquet_local(p, columns=columns)
+    if gdf is None or gdf.empty:
+        return gdf
+
+    iso = (iso3 or "").upper()
+    INTEREST = {"USA", "FRA", "ESP", "PRT", "DNK", "NOR", "CHN"}
+    if iso not in INTEREST:
+        return gdf
+
+    name_col = (
+        "shapeName"
+        if "shapeName" in gdf.columns
+        else ("NAME_1" if "NAME_1" in gdf.columns else gdf.columns[0])
+    )
+
+    # Work in Web Mercator (meters) for consistent translations
+    g = gdf.to_crs(3857).copy()
+    g["_cx"] = g.geometry.centroid.x
+    g["_cy"] = g.geometry.centroid.y
+
+    # Mainland bounding boxes per country (in Web Mercator)
+    def _usa(df): return (df["_cx"].between(-1.42e7, -7.3e6)) & (df["_cy"].between(2.8e6, 6.5e6))
+    def _fra(df): return (df["_cx"].between(-7.1e5, 1.2e6)) & (df["_cy"].between(5.0e6, 6.7e6))
+    def _esp(df): return (df["_cx"].between(-1.3e6, -2.0e5)) & (df["_cy"].between(4.0e6, 5.1e6))
+    def _prt(df): return (df["_cx"].between(-1.35e6, -9.0e5)) & (df["_cy"].between(4.2e6, 4.9e6))
+    def _dnk(df): return (df["_cx"].between(7.0e5, 1.4e6)) & (df["_cy"].between(7.0e6, 7.8e6))
+    def _nor(df): return (df["_cx"].between(3.0e5, 1.7e6)) & (df["_cy"].between(7.1e6, 9.2e6))
+    def _chn(df): return (df["_cx"].between(7.0e5, 1.4e6)) & (df["_cy"].between(3.0e6, 6.0e6))
+
+    RULE = {"USA": _usa, "FRA": _fra, "ESP": _esp, "PRT": _prt, "DNK": _dnk, "NOR": _nor, "CHN": _chn}
+
+    m_main = RULE[iso](g)
+    if not m_main.any():
+        return gdf
+
+    minx, miny, maxx, maxy = g.loc[m_main, "geometry"].total_bounds
+    width = maxx - minx
+    height = maxy - miny
+
+    TERR = {
+        "USA": {
+            "Alaska": ["Alaska"],
+            "Hawaii": ["Hawaii"],
+            "Puerto Rico": ["Puerto Rico"],
+            "Guam": ["Guam"],
+            "American Samoa": ["American Samoa"],
+            "Northern Mariana Islands": [
+                "Northern Mariana Islands",
+                "Commonwealth of the Northern Mariana Islands",
+                "N. Mariana Islands",
+            ],
+            "U.S. Virgin Islands": [
+                "United States Virgin Islands",
+                "U.S. Virgin Islands",
+                "Virgin Islands of the United States",
+            ],
+            "UM": [
+                "United States Minor Outlying Islands",
+                "Baker Island",
+                "Howland Island",
+                "Jarvis Island",
+                "Johnston Atoll",
+                "Kingman Reef",
+                "Midway Atoll",
+                "Palmyra Atoll",
+                "Wake Island",
+            ],
+        },
+        "FRA": {
+            "Guyane": ["Guyane", "French Guiana"],
+            "Guadeloupe": ["Guadeloupe"],
+            "Martinique": ["Martinique"],
+            "Mayotte": ["Mayotte"],
+            "La Réunion": ["La Réunion", "Reunion", "Réunion"],
+        },
+        "ESP": {
+            "Islas Canarias": ["Canarias", "Islas Canarias", "Canary Islands"],
+            "Ceuta": ["Ceuta"],
+            "Melilla": ["Melilla"],
+        },
+        "PRT": {
+            "Açores": ["Açores", "Azores"],
+            "Madeira": ["Madeira", "Região Autónoma da Madeira"],
+        },
+        "DNK": {
+            "Greenland": ["Greenland", "Kalaallit Nunaat", "Grønland"],
+            "Faroe": ["Faroe", "Faroe Islands", "Føroyar"],
+        },
+        "NOR": {"Svalbard": ["Svalbard"], "Jan Mayen": ["Jan Mayen"]},
+        "CHN": {
+            "Hong Kong": ["Hong Kong", "Hong Kong SAR"],
+            "Macao": ["Macao", "Macau", "Macao SAR", "Macau SAR"],
+        },
+    }
+
+    def _move(mask, x_rel, y_rel):
+        if mask.any():
+            g.loc[mask, "geometry"] = g.loc[mask, "geometry"].apply(
+                lambda geom: shp_translate(
+                    geom,
+                    xoff=(minx + x_rel * width) - geom.centroid.x,
+                    yoff=(miny + y_rel * height) - geom.centroid.y,
+                )
+            )
+
+    if iso == "USA":
+        m_ak = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["Alaska"])) | (
+            (g["_cx"] < -1.6e7) & (g["_cy"] > 7.5e6)
+        )
+        m_hi = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["Hawaii"])) | (
+            (g["_cx"] < -1.6e7) & (g["_cy"] < 3.0e6)
+        )
+        m_pr = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["Puerto Rico"])) | (
+            (g["_cx"] > -7.7e6)
+            & (g["_cx"] < -6.8e6)
+            & (g["_cy"].between(2.0e6, 2.4e6))
+        )
+        m_gu = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["Guam"])) | (
+            (g["_cx"] > 1.2e7) & (g["_cy"] < 2.0e6)
+        )
+        m_as = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["American Samoa"])) | (
+            (g["_cx"] < -1.8e7) & (g["_cy"] < -1.0e6)
+        )
+        m_mp = g[name_col].apply(
+            lambda n: _name_matches(n, TERR["USA"]["Northern Mariana Islands"])
+        ) | ((g["_cx"] > 1.5e7) & (g["_cy"] < 2.0e6))
+        m_vi = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["U.S. Virgin Islands"])) | (
+            (g["_cx"] > -7.0e6) & (g["_cy"].between(2.0e6, 2.5e6))
+        )
+        m_um = g[name_col].apply(lambda n: _name_matches(n, TERR["USA"]["UM"]))
+
+        _move(m_ak, -0.18, 0.92)
+        _move(m_hi, 0.12, 0.07)
+        _move(m_pr, 0.88, 0.12)
+        _move(m_gu, 0.84, 0.06)
+        _move(m_as, 0.80, 0.06)
+        _move(m_mp, 0.90, 0.06)
+        _move(m_vi, 0.94, 0.06)
+        _move(m_um, 0.76, 0.06)
+
+    if iso == "FRA":
+        for nm, xy in [
+            ("Guyane", (0.10, -0.05)),
+            ("Guadeloupe", (0.16, -0.03)),
+            ("Martinique", (0.18, -0.03)),
+            ("Mayotte", (0.21, -0.03)),
+            ("La Réunion", (0.24, -0.03)),
+        ]:
+            m = g[name_col].apply(lambda n, nms=[nm]: _name_matches(n, nms))
+            _move(m, *xy)
+
+    if iso == "ESP":
+        for nm, xy in [
+            ("Islas Canarias", (-0.05, -0.02)),
+            ("Ceuta", (0.02, -0.01)),
+            ("Melilla", (0.03, -0.01)),
+        ]:
+            m = g[name_col].apply(lambda n, nms=[nm]: _name_matches(n, nms))
+            _move(m, *xy)
+
+    if iso == "PRT":
+        for nm, xy in [("Açores", (-0.08, 0.02)), ("Madeira", (-0.02, -0.02))]:
+            m = g[name_col].apply(lambda n, nms=[nm]: _name_matches(n, nms))
+            _move(m, *xy)
+
+    if iso == "DNK":
+        for nm, xy in [("Faroe", (-0.05, 0.15)), ("Greenland", (0.05, 0.85))]:
+            m = g[name_col].apply(lambda n, nms=[nm]: _name_matches(n, nms))
+            _move(m, *xy)
+
+    if iso == "NOR":
+        for nm, xy in [("Svalbard", (0.30, 0.90)), ("Jan Mayen", (0.05, 0.85))]:
+            m = g[name_col].apply(lambda n, nms=[nm]: _name_matches(n, nms))
+            _move(m, *xy)
+
+    if iso == "CHN":
+        for nm, xy in [("Hong Kong", (0.90, -0.02)), ("Macao", (0.92, -0.02))]:
+            m = g[name_col].apply(lambda n, nms=[nm]: _name_matches(n, nms))
+            _move(m, *xy)
+
+    g = g.to_crs(4326)
+    g.drop(columns=["_cx", "_cy"], errors="ignore", inplace=True)
+    return g
 
 
 st.set_page_config(page_title="Humidity Dashboard", layout="wide", initial_sidebar_state="collapsed")
@@ -108,22 +245,121 @@ CBLIND = {
     "yellow":"#F0E442","navy":"#332288","verm":"#D55E00","pink":"#CC79A7","grey":"#999999","red":"#d62728"
 }
 
+# --- HF SPACE HELPERS (humidity via HF space, not local) ---
+HF_SPACE_BASE = "https://huggingface.co/spaces/pjsimba16/adb-climate-data/resolve/main"
+
+def _note_err(msg: str) -> None:
+    st.session_state.setdefault("hf_errors", []).append(str(msg))
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _read_parquet_from_space(rel_path: str):
+    """Generic helper to read a parquet file from the HF Space using HTTPS."""
+    url = f"{HF_SPACE_BASE}/{rel_path.lstrip('/')}"
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+    except Exception as e:  # pragma: no cover
+        _note_err(f"HF download failed for {rel_path}: {e}")
+        return None
+    try:
+        return pd.read_parquet(io.BytesIO(resp.content))
+    except Exception as e:  # pragma: no cover
+        _note_err(f"Parquet read failed for {rel_path}: {e}")
+        return None
+
+def _canonical_type(t: str) -> str:
+    t = (t or "").strip().lower()
+    if t in {"wind", "wind speed", "windspeed", "wind speeds"}:
+        return "Wind speeds"
+    if t in {"temperature", "temp"}:
+        return "Temperature"
+    if t in {"precipitation", "rain", "prcp", "precip"}:
+        return "Precipitation"
+    if t in {"humidity", "humid"}:
+        return "Humidity"
+    return (t or "").strip().title()
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _load_availability_snapshot():
+    df = _read_parquet_from_space("availability_snapshot.parquet")
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["iso3", "indicator_type", "freq", "has_data"])
+    df = df.copy()
+    col_map = {c.lower(): c for c in df.columns}
+    iso_col = col_map.get("iso3") or col_map.get("iso")
+    type_col = col_map.get("indicator_type") or col_map.get("type")
+    freq_col = col_map.get("freq") or col_map.get("frequency")
+    has_col = (
+        col_map.get("has_data")
+        or col_map.get("has_any")
+        or col_map.get("available")
+    )
+    if not iso_col or not type_col:
+        _note_err("availability_snapshot.parquet is missing iso3/type columns.")
+        return pd.DataFrame(columns=["iso3", "indicator_type", "freq", "has_data"])
+    df[iso_col] = df[iso_col].astype(str).str.upper().str.strip()
+    df[type_col] = df[type_col].astype(str).map(_canonical_type)
+    if has_col and has_col in df.columns:
+        df = df[df[has_col].astype(bool)]
+    out = pd.DataFrame(
+        {
+            "iso3": df[iso_col].values,
+            "indicator_type": df[type_col].values,
+            "freq": df[freq_col].values if freq_col else "Monthly",
+        }
+    )
+    out["has_data"] = True
+    return out
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _humidity_isos_from_availability():
+    snap = _load_availability_snapshot()
+    if snap is None or snap.empty:
+        return []
+    mask = snap["indicator_type"].astype(str).str.lower() == "humidity"
+    return sorted(snap.loc[mask, "iso3"].astype(str).str.upper().unique().tolist())
+
+
 # ---------- CSS (align KPI look with Temperature page) ----------
 st.markdown("""
 <style>
-div[data-testid="metric-container"] div[data-testid="stMetricValue"] { 
-  font-size: 34px !important; line-height:1.1;
+.kpi-row {
+  display:flex;
+  flex-wrap:wrap;
+  gap:0.75rem;
+  margin-bottom:0.75rem;
 }
-div[data-testid="metric-container"] > div:first-child { 
-  font-size: 14px !important;
+.kpi {
+  flex:1 1 180px;
+  min-width:160px;
+  background:transparent;
+  border-radius:0;
+  padding:0;
+  border:none;
 }
-.kpi { display:flex; flex-direction:column; gap:2px; }
-.kpi .row { display:flex; align-items:center; gap:6px; }
-.kpi .label { font-size:14px; color:#334155; display:flex; align-items:center; gap:6px; }
-.kpi .value { font-size:34px; line-height:1.05; font-weight:600; }
+.kpi .label {
+  font-size:1.2rem;
+  color:#64748b;
+  margin-bottom:0.15rem;
+}
+.kpi .row {
+  display:flex;
+  align-items:center;
+  gap:0.4rem;
+}
+.kpi .value {
+  font-size:3.00rem;
+  font-weight:600;
+  color:#0f172a;
+}
 .kpi .badge {
-  display:inline-block; line-height:1; border-radius:999px; padding:2px 6px;
-  border:1px solid #e5e7eb; font-size:11px; font-weight:700; color:#334155;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  font-size:1.0rem;
+  font-weight:600;
+  padding:0.05rem 0.35rem;
+  border-radius:999px;
 }
 .kpi .up   { background:#dcfce7; }
 .kpi .down { background:#fee2e2; }
@@ -246,32 +482,60 @@ def _adm1_file(iso3, adm1_name, freq):
 
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def list_available_isos():
-    if not COUNTRY_DATA_DIR.exists(): return []
-    out = []
-    for d in sorted(COUNTRY_DATA_DIR.iterdir()):
-        try:
-            if d.is_dir() and len(d.name) == 3:
-                out.append(d.name.upper())
-        except Exception:
-            continue
-    return out
+    """List ISO3 codes with Humidity data, based on HF availability_snapshot."""
+    try:
+        isos = _humidity_isos_from_availability()
+    except Exception:
+        isos = []
+    return list(isos or [])
+
 
 # ===================== SERIES LOADERS =====================
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_scope_series(iso3, freq, area_label, indicator_codes):
+    """Load ADM0/ADM1 series for the given ISO3 and area from the HF Space."""
     mapper = load_indicator_mapper()
     is_country = (area_label in ("", "Country (all)"))
     suffixes = _suffixes_for_freq(freq, "ADM0" if is_country else "ADM1")
-    path = _adm0_file(iso3, freq) if is_country else _adm1_file(iso3, area_label, freq)
-    if path is None:
+
+    iso3u = str(iso3 or "").upper()
+    folder = {
+        "Monthly": "Monthly",
+        "Seasonal": "Seasonal",
+        "Annual": "Annual",
+    }[str(freq)]
+
+    df_raw = None
+    if is_country:
+        # Country (ADM0)
+        rel_path = f"country_data/{iso3u}/{folder}/{iso3u}_ADM0_data.parquet"
+        df_raw = _read_parquet_from_space(rel_path)
+    else:
+        # ADM1: try a few filename variants, then a normalized fallback
+        adm1 = str(area_label or "")
+        base_rel = f"country_data/{iso3u}/{folder}"
+        candidates = [
+            f"{base_rel}/{adm1}_ADM1_data.parquet",
+            f"{base_rel}/{adm1.replace(' ', '_')}_ADM1_data.parquet",
+            f"{base_rel}/{adm1.replace('/', '-')}_ADM1_data.parquet",
+        ]
+        for rel in candidates:
+            df_raw = _read_parquet_from_space(rel)
+            if isinstance(df_raw, pd.DataFrame) and not df_raw.empty:
+                break
+        if df_raw is None or (isinstance(df_raw, pd.DataFrame) and df_raw.empty):
+            norm = _norm_str(adm1).replace(" ", "_")
+            if norm:
+                rel = f"{base_rel}/{norm}_ADM1_data.parquet"
+                df_raw = _read_parquet_from_space(rel)
+
+    if not isinstance(df_raw, pd.DataFrame) or df_raw.empty:
         return pd.DataFrame(), {}
-    try:
-        df_raw = pd.read_parquet_smart(path)
-    except Exception:
-        return pd.DataFrame(), {}
+
     df = df_raw.copy()
     df["date"] = _build_date_column(df, freq)
     df = df.dropna(subset=["date"]).sort_values("date")
+
     out = pd.DataFrame({"date": df["date"]})
     pretty = {}
     for code in indicator_codes:
@@ -279,7 +543,9 @@ def load_scope_series(iso3, freq, area_label, indicator_codes):
         if col:
             out[code] = pd.to_numeric(df[col], errors="coerce")
             pretty[code] = _compose_title(code, mapper, code)
+
     return out.reset_index(drop=True), pretty
+
 
 def _prep_single(iso3_now, area_label, freq, code_avg, code_var=None):
     codes = [code_avg] + ([code_var] if code_var else [])
@@ -302,27 +568,47 @@ def _get_hf_token():
         pass
     return os.getenv("HF_TOKEN", "")
 
-@st.cache_data(ttl=7*24*3600, show_spinner=False)
-def load_country_adm1_geojson(iso3):
+@st.cache_data(ttl=7 * 24 * 3600, show_spinner=False)
+def load_country_adm1_geojson(iso3: str):
+    """
+    Load ADM1 GeoJSON, then apply composite layout (USA/FRA/ESP/PRT/DNK/NOR/CHN
+    get their territories pulled in as insets).
+    """
     if hf_hub_download is None:
         raise FileNotFoundError("huggingface_hub is not installed/available.")
+
     last_err = None
-    for repo_type in ("space","dataset"):
+    iso3u = (iso3 or "").upper()
+    for repo_type in ("space", "dataset"):
         try:
-            path = hf_hub_download(repo_id=HF_REPO_ID, repo_type=repo_type,
-                                   filename=f"ADM1_geodata/{iso3}.geojson",
-                                   token=_get_hf_token())
+            path = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                repo_type=repo_type,
+                filename=f"ADM1_geodata/{iso3u}.geojson",
+                token=_get_hf_token(),
+            )
             gdf = gpd.read_file(path)
-            try: gdf["geometry"] = gdf["geometry"].buffer(0)
-            except Exception: pass
+            try:
+                gdf["geometry"] = gdf["geometry"].buffer(0)
+            except Exception:
+                pass
             gdf = gdf.to_crs(4326)
-            bounds = tuple(gdf.total_bounds)
-            name_col = "shapeName" if "shapeName" in gdf.columns else ("NAME_1" if "NAME_1" in gdf.columns else gdf.columns[0])
-            return gdf.__geo_interface__, bounds, name_col, gdf
+
+            # 👇 THIS is the key: rearrange territories like in v0
+            gdf_comp = _composite_adm1_layout(iso3u, gdf)
+
+            bounds = tuple(gdf_comp.total_bounds)
+            name_col = (
+                "shapeName"
+                if "shapeName" in gdf_comp.columns
+                else ("NAME_1" if "NAME_1" in gdf_comp.columns else gdf_comp.columns[0])
+            )
+            return gdf_comp.__geo_interface__, bounds, name_col, gdf_comp
         except Exception as e:
             last_err = e
             continue
     raise last_err
+
 
 @st.cache_data(ttl=7*24*3600, show_spinner=False)
 def adm1_label_points(iso3):
@@ -331,77 +617,181 @@ def adm1_label_points(iso3):
     return pts.x.to_numpy(), pts.y.to_numpy(), gdf[name_col].astype(str).to_numpy(), name_col
 
 # ===================== MAP DATA (latest HUMA) =====================
+# ===================== MAP DATA (latest HUMA) =====================
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _load_humidity_adm1_snapshot():
+    """Latest ADM1 HUMA snapshot for all countries/frequencies (for map)."""
+    df = _read_parquet_from_space("indicator_snapshots/humidity_adm1_latest.parquet")
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    col_map = {c.lower(): c for c in df.columns}
+    iso_col = col_map.get("iso3") or col_map.get("iso")
+    adm1_col = (
+        col_map.get("adm1")
+        or col_map.get("city")
+        or col_map.get("region")
+        or col_map.get("name_1")
+        or col_map.get("shapename")
+    )
+    freq_col = col_map.get("freq") or col_map.get("frequency")
+    date_col = col_map.get("date") or col_map.get("time") or col_map.get("period")
+    value_col = col_map.get("value")
+    if not value_col:
+        for c in df.columns:
+            cl = str(c).lower()
+            if "huma" in cl or "humid" in cl:
+                value_col = c
+                break
+    if not iso_col or not adm1_col or not date_col or not value_col:
+        _note_err("humidity_adm1_latest.parquet is missing required columns.")
+        return pd.DataFrame()
+    out = pd.DataFrame(
+        {
+            "iso3": df[iso_col].astype(str).str.upper().str.strip(),
+            "ADM1": df[adm1_col].astype(str).str.strip(),
+            "Date": pd.to_datetime(df[date_col], errors="coerce"),
+            "value": pd.to_numeric(df[value_col], errors="coerce"),
+        }
+    )
+    if freq_col and freq_col in df.columns:
+        out["freq"] = df[freq_col].astype(str).str.title()
+    else:
+        out["freq"] = "Monthly"
+    out = out.dropna(subset=["iso3", "ADM1", "Date", "value"])
+    return out
+
 @st.cache_data(ttl=900, show_spinner=False)
-def load_latest_adm1_for_map(iso3, freq):
-    def _scan_one(iso3_in, freq_in):
-        base_dir = COUNTRY_DATA_DIR / str(iso3_in).upper() / {"Monthly":"Monthly","Seasonal":"Seasonal","Annual":"Annual"}[str(freq_in)]
-        if not base_dir.exists():
-            return pd.DataFrame(columns=["ADM1","value","Date"])
-        suffixes = _suffixes_for_freq(freq_in, "ADM1")
-        rows=[]
-        for f in sorted(base_dir.glob("*_ADM1_data.parquet")):
-            try:
-                cols = list(pd.read_parquet_smart(f, columns=None).columns)
-            except Exception:
-                continue
-            col = _pick_col(cols, "HUMA", suffixes)
-            if not col: continue
-            use_cols = ["ADM1","Year", col]
-            if str(freq_in) == "Monthly": use_cols.append("Month")
-            elif str(freq_in) == "Seasonal": use_cols.append("Season")
-            try:
-                d = pd.read_parquet_smart(f, columns=use_cols)
-            except Exception:
-                continue
-            d = d.rename(columns={col:"value"})
-            d["date"] = _build_date_column(d, freq_in)
-            d = d.dropna(subset=["ADM1","date","value"])
-            if d.empty: continue
-            d = d.sort_values("date").tail(1).rename(columns={"date":"Date"})
-            rows.append(d[["ADM1","value","Date"]])
-        if not rows: return pd.DataFrame(columns=["ADM1","value","Date"])
-        return (pd.concat(rows, ignore_index=True)
-                  .sort_values(["ADM1","Date"])
-                  .drop_duplicates("ADM1", keep="last")
-                  .reset_index(drop=True))
-    df = _scan_one(iso3, freq)
+def load_latest_adm1_for_map(iso3: str, freq: str, want_debug: bool = False):
+    """
+    Return the latest available ADM1 HUMA value per region for the country,
+    using the precomputed ADM1 snapshot stored in the HF Space.
+    Returns a DataFrame with columns ['ADM1', 'value', 'Date'].
+    """
+    snap = _load_humidity_adm1_snapshot()
+    iso3u = str(iso3 or "").upper()
+    freq_req = str(freq).title()
+    df_empty = pd.DataFrame(columns=["ADM1", "value", "Date"])
+
+    if snap is None or snap.empty:
+        if want_debug:
+            meta = {
+                "iso3": iso3u,
+                "freq_requested": freq_req,
+                "rows": 0,
+                "source": "snapshot_empty",
+            }
+            return df_empty, [("snapshot", meta)]
+        return df_empty
+
+    df = snap.copy()
+    df = df[df["iso3"].astype(str).str.upper() == iso3u]
     if df.empty:
-        for f in ["Monthly","Seasonal","Annual"]:
-            if f == freq: continue
-            dfi = _scan_one(iso3, f)
-            if not dfi.empty:
-                dfi["__actual_freq_used__"] = f
-                return dfi
-    return df
+        if want_debug:
+            meta = {
+                "iso3": iso3u,
+                "freq_requested": freq_req,
+                "rows": 0,
+                "source": "snapshot_no_iso",
+            }
+            return df_empty, [("snapshot", meta)]
+        return df_empty
+
+    dbg_source = "snapshot"
+    if "freq" in df.columns:
+        df_freq = df[df["freq"].astype(str).str.title() == freq_req]
+        if df_freq.empty:
+            df_freq = df
+            dbg_source = "snapshot_any_freq"
+    else:
+        df_freq = df
+        dbg_source = "snapshot_no_freq_col"
+
+    if df_freq.empty:
+        if want_debug:
+            meta = {
+                "iso3": iso3u,
+                "freq_requested": freq_req,
+                "rows": 0,
+                "source": dbg_source,
+            }
+            return df_empty, [("snapshot", meta)]
+        return df_empty
+
+    out = (
+        df_freq[["ADM1", "value", "Date"]]
+        .dropna(subset=["ADM1", "Date", "value"])
+        .sort_values(["ADM1", "Date"])
+        .drop_duplicates("ADM1", keep="last")
+        .reset_index(drop=True)
+    )
+
+    if want_debug:
+        meta = {
+            "iso3": iso3u,
+            "freq_requested": freq_req,
+            "rows": len(out),
+            "source": dbg_source,
+        }
+        return out, [("snapshot", meta)]
+    return out
+
 
 # ===================== ELEVATION (optional, same as Temp) =====================
 @st.cache_data(ttl=24*3600, show_spinner=False)
 def _load_city_map():
-    here = os.path.dirname(__file__)
+    """
+    Load elevation / city mapping from the HF space.
+
+    Tries:
+      - city_mapper_with_coords_v3.csv
+      - city_mapper_with_coords_v2.csv
+
+    Returns a DataFrame with columns: ['ADM0', 'ADM1', 'elevation'].
+    """
     candidates = [
-        os.path.normpath(os.path.join(here, "..", "city_mapper_with_coords_v3.csv")),
-        os.path.normpath(os.path.join(here, "..", "city_mapper_with_coords_v2.csv")),
-        os.path.join(here, "city_mapper_with_coords_v3.csv"),
-        os.path.join(here, "city_mapper_with_coords_v2.csv"),
-        "/mnt/data/city_mapper_with_coords_v3.csv",
-        "/mnt/data/city_mapper_with_coords_v2.csv",
+        "city_mapper_with_coords_v3.csv",
+        "city_mapper_with_coords_v2.csv",
     ]
-    for fp in candidates:
+
+    for rel_path in candidates:
+        url = f"{HF_SPACE_BASE}/{rel_path.lstrip('/')}"
         try:
-            if os.path.isfile(fp):
-                df = pd.read_csv(fp)
-                cn_country = next((c for c in df.columns if c.lower()=="country"), None)
-                cn_city    = next((c for c in df.columns if c.lower()=="city"), None)
-                cn_elev    = next((c for c in df.columns if "elev" in c.lower()), None)
-                if not (cn_country and cn_city and cn_elev): continue
-                df = df.rename(columns={cn_country:"ADM0", cn_city:"ADM1", cn_elev:"elevation"})
-                df["ADM0"] = df["ADM0"].astype(str).str.upper().str.strip()
-                df["ADM1"] = df["ADM1"].astype(str).str.strip()
-                df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
-                return df[["ADM0","ADM1","elevation"]].copy()
-        except Exception:
+            resp = requests.get(url)
+            resp.raise_for_status()
+        except Exception as e:
+            _note_err(f"HF download failed for {rel_path}: {e}")
             continue
-    return pd.DataFrame(columns=["ADM0","ADM1","elevation"])
+
+        try:
+            df = pd.read_csv(io.StringIO(resp.content.decode("utf-8")))
+        except Exception as e:
+            _note_err(f"CSV parse failed for {rel_path}: {e}")
+            continue
+
+        cn_country = next((c for c in df.columns if c.lower() == "country"), None)
+        cn_city    = next((c for c in df.columns if c.lower() == "city"), None)
+        cn_elev    = next((c for c in df.columns if "elev" in c.lower()), None)
+
+        if not (cn_country and cn_city and cn_elev):
+            _note_err(
+                f"{rel_path} missing expected columns (country/city/elev); "
+                f"found: {list(df.columns)}"
+            )
+            continue
+
+        df = df.rename(
+            columns={cn_country: "ADM0", cn_city: "ADM1", cn_elev: "elevation"}
+        )
+        df["ADM0"] = df["ADM0"].astype(str).str.upper().str.strip()
+        df["ADM1"] = df["ADM1"].astype(str).str.strip()
+        df["elevation"] = pd.to_numeric(df["elevation"], errors="coerce")
+
+        return df[["ADM0", "ADM1", "elevation"]].copy()
+
+    _note_err("Could not load city_mapper_with_coords from HF space.")
+    return pd.DataFrame(columns=["ADM0", "ADM1", "elevation"])
+
 
 def _elevation_completeness(iso3, geojson_dict, city_map):
     try:
@@ -531,26 +921,43 @@ with lc:
                 hover_tmpl = "<b>%{customdata[0]}</b><br>Latest: %{customdata[1]:.2f} %<br>As of: %{customdata[2]}<extra></extra>"
 
             fig = px.choropleth(
-                df_map, geojson=geojson_dict, locations="ADM1",
-                featureidkey=f"properties.{name_col}", color=color_col,
-                projection="mercator", color_continuous_scale=cs_name,
+                df_map,
+                geojson=geojson_dict,
+                locations="ADM1",
+                featureidkey=f"properties.{name_col}",
+                color=color_col,
+                projection="mercator",
+                color_continuous_scale=cs_name,
             )
-            minx, miny, maxx, maxy = bounds
-            pad = 0.35
+
             fig.update_geos(
-                projection_type="mercator", fitbounds="locations",
-                lonaxis_range=[minx - pad, maxx + pad],
-                lataxis_range=[miny - pad, maxy + pad],
-                showland=False, showcountries=False, showcoastlines=False, showocean=False, visible=False,
+                projection_type="mercator",
+                fitbounds="locations",
+                showland=False,
+                showcountries=False,
+                showcoastlines=False,
+                showocean=False,
+                visible=False,
             )
+
             fig.update_layout(
-                margin=dict(l=0, r=0, t=0, b=0), height=MAP_HEIGHT,
-                paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-                hovermode="closest", showlegend=False,
+                margin=dict(l=0, r=0, t=0, b=0),
+                height=MAP_HEIGHT,
+                paper_bgcolor="#ffffff",
+                plot_bgcolor="#ffffff",
+                hovermode="closest",
+                showlegend=False,
+                # keep your existing colorbar config
                 coloraxis_colorbar=dict(
-                    title=cbar_title, thickness=14, len=0.98, y=0.92, yanchor="top", x=0.98,
-                    tickfont=dict(size=10), titlefont=dict(size=11),
-                )
+                    title=cbar_title,
+                    thickness=14,
+                    len=0.92,
+                    x=0.98,
+                    y=0.5,
+                    yanchor="middle",
+                    tickfont=dict(size=10),
+                    titlefont=dict(size=11),
+                ),
             )
             _date_str = pd.to_datetime(df_map["Date"], errors="coerce").dt.strftime("%Y-%m").fillna("—")
             vals = pd.to_numeric(df_map[color_col], errors="coerce")
@@ -669,11 +1076,11 @@ with rc:
         mean_v     = float(np.nanmean(srt["avg"])) if len(srt) else np.nan
         sigmas     = np.sqrt(srt["var"].clip(lower=0)) if "var" in srt.columns else None
         std_v      = float(np.nanmean(sigmas)) if (sigmas is not None and sigmas.notna().any()) else float(np.nanstd(srt["avg"]))
-        with k1: st.metric("Latest Avg Humidity (HUMA)", f"{latest:.2f} %")
+        with k1: render_kpi("Latest Avg Humidity (HUMA)", f"{latest:.2f} %", None, show_symbol=False)
         with k2: render_kpi("Δ vs previous point", (f"{delta_prev:+.2f} %" if np.isfinite(delta_prev) else "—"), delta_prev)
         ly_label = "Δ vs same month LY" if freq_sel=="Monthly" else ("Δ vs same season LY" if freq_sel=="Seasonal" else "Δ vs same year LY")
         with k3: render_kpi(ly_label, (f"{delta_yoy:+.2f} %" if np.isfinite(delta_yoy) else "—"), delta_yoy)
-        with k4: st.metric("Mean / σ in range", (f"{mean_v:.2f} % • {std_v:.2f}" if np.isfinite(mean_v) and np.isfinite(std_v) else "—"))
+        with k4: render_kpi("Mean / σ in range", (f"{mean_v:.2f} % • {std_v:.2f}" if np.isfinite(mean_v) and np.isfinite(std_v) else "—"), None, show_symbol=False)
 
     st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
 
@@ -741,13 +1148,29 @@ if not iso3_now:
 
 # ===================== Legend helper =====================
 def set_legend_top(fig):
+    # Actually place legend at the bottom for all humidity charts
     fig.update_layout(
-        legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0.0, xanchor="left", bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
-        margin=dict(t=80)
+        legend=dict(
+            orientation="h",
+            x=0.0,
+            xanchor="left",
+            y=-0.25,       # below the x-axis
+            yanchor="top",
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=11),
+        ),
+        # Only touch bottom margin so we don't override per-chart top margins
+        margin=dict(b=80),
     )
+
 
 # ===================== CHART RENDERERS =====================
 def _render_h_chart(chart_key, story_title_md, plot_title, avg_code, var_code=None, *, ylab="%", show_form=False):
+    # per-chart hide-country state
+    hide_country_key = f"{chart_key}_hide_country"
+    prev_adm1_sel = st.session_state.get(f"{chart_key}_adm1s", [])
+    had_adm1_prev = bool(prev_adm1_sel)
+
     # columns: 0.2 | 0.7 | 0.1  (HUMX/HUMN will bypass form)
     story_col, chart_col, opts_col = st.columns([0.2, 0.7, 0.1], gap="large")
 
@@ -758,11 +1181,27 @@ def _render_h_chart(chart_key, story_title_md, plot_title, avg_code, var_code=No
         with opts_col:
             with st.form(f"form_{chart_key}"):
                 st.markdown("**Display options**", help="Only affects this chart.")
-                show_avg  = st.checkbox("Show average", value=True,  key=f"{chart_key}_avg")
+                show_avg  = st.checkbox("Show indicator", value=True,  key=f"{chart_key}_avg")
                 show_band = st.checkbox("Show ±1σ band", value=True, key=f"{chart_key}_band")
+
+                # Only show hide-country toggle once user has selected ADM1s at least once
+                if had_adm1_prev:
+                    st.checkbox(
+                        "Hide Country Line",
+                        value=st.session_state.get(hide_country_key, False),
+                        key=hide_country_key,
+                        help="Hide the Country (all) line so you can compare ADM1s directly.",
+                    )
+                else:
+                    # If no ADM1s have ever been selected yet, reset the flag
+                    st.session_state[hide_country_key] = False
+
                 st.form_submit_button("Apply changes", type="primary")
     else:
+        # Charts without a side form (if we ever use _render_h_chart that way)
         show_avg, show_band = True, False
+        # IMPORTANT: do NOT reset hide_country_key here; we handle it inline.
+
 
     # ADM1 selector (this chart only)
     try:
@@ -770,15 +1209,39 @@ def _render_h_chart(chart_key, story_title_md, plot_title, avg_code, var_code=No
         _adm1_all = sorted(gdf_all[nc].astype(str).unique().tolist())
     except Exception:
         _adm1_all = []
+
     with chart_col:
         adm1_sel = st.multiselect(
             "Compare ADM1s (max 5)",
             options=_adm1_all,
             default=st.session_state.get(f"{chart_key}_adm1s", []),
-            max_selections=5, key=f"{chart_key}_adm1s",
+            max_selections=5,
+            key=f"{chart_key}_adm1s",
             placeholder="Type to search and select ADM1s…",
-            help="Adds selected ADM1 lines to THIS chart (Country baseline is always shown)."
+            help="Adds selected ADM1 lines to THIS chart."
         )
+
+        # determine hide_country for this chart
+        if show_form:
+            # For HUMA, hide-country is driven by the side form checkbox
+            if adm1_sel:
+                hide_country = bool(st.session_state.get(hide_country_key, False))
+            else:
+                st.session_state[hide_country_key] = False
+                hide_country = False
+        else:
+            # If we ever call _render_h_chart without a form, manage it inline
+            if adm1_sel:
+                hide_country = st.checkbox(
+                    "Hide Country Line",
+                    key=hide_country_key,
+                    value=st.session_state.get(hide_country_key, False),
+                    help="Hide the Country (all) line so you can compare ADM1s directly.",
+                )
+            else:
+                st.session_state[hide_country_key] = False
+                hide_country = False
+
 
     def _series_for(area):
         codes = [avg_code] + ([var_code] if var_code else [])
@@ -790,7 +1253,12 @@ def _render_h_chart(chart_key, story_title_md, plot_title, avg_code, var_code=No
             out["var"] = pd.to_numeric(df_codes[var_code], errors="coerce")
         return out.dropna(subset=["date"]).sort_values("date")
 
-    targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
+    has_adm1_now = bool(adm1_sel)
+    if hide_country and has_adm1_now:
+        targets = [a for a in adm1_sel if a != "Country (all)"]
+    else:
+        targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
+
     sdict = {g: _series_for(g) for g in targets}
     sdict = {k:v for k,v in sdict.items() if not v.empty}
     if not sdict:
@@ -865,6 +1333,9 @@ def _render_h_chart(chart_key, story_title_md, plot_title, avg_code, var_code=No
         st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 def _render_simple(chart_key, story_title_md, plot_title, avg_code, ylab="%"):
+    
+    hide_country_key = f"{chart_key}_hide_country"
+
     # columns: 0.2 | 0.79 | 0.01
     story_col, chart_col, _ = st.columns([0.2, 0.79, 0.01], gap="large")
 
@@ -882,15 +1353,32 @@ def _render_simple(chart_key, story_title_md, plot_title, avg_code, ylab="%"):
             "Compare ADM1s (max 5)",
             options=_adm1_all,
             default=st.session_state.get(f"{chart_key}_adm1s", []),
-            max_selections=5, key=f"{chart_key}_adm1s",
-            placeholder="Type to search and select ADM1s…"
+            max_selections=5,
+            key=f"{chart_key}_adm1s",
+            placeholder="Type to search and select ADM1s…",
+            help="Adds selected ADM1 lines to THIS chart."
         )
+
+        if adm1_sel:
+            hide_country = st.checkbox(
+                "Hide Country Line",
+                key=hide_country_key,
+                value=st.session_state.get(hide_country_key, False),
+                help="Hide the Country (all) line so you can compare ADM1s directly.",
+            )
+        else:
+            st.session_state[hide_country_key] = False
+            hide_country = False
 
     def _series_for(area):
         s = _prep_single(iso3_now, area, freq, avg_code, None)
         return s
 
-    targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
+    has_adm1_now = bool(adm1_sel)
+    if hide_country and has_adm1_now:
+        targets = [a for a in adm1_sel if a != "Country (all)"]
+    else:
+        targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
     sdict = {g: _series_for(g) for g in targets}
     sdict = {k:v for k,v in sdict.items() if not v.empty}
     if not sdict:
@@ -980,15 +1468,13 @@ pct_choice = st.radio(
     horizontal=True, index=1, key="pct_h_single"
 )
 
-# Shared ADM1 multiselect for all percentile charts
+# ADM1 choices for percentile charts (each chart will have its own selector)
 try:
     _, _, name_col_all, gdf_all = load_country_adm1_geojson(iso3_now)
-    pct_adm1_all = sorted(gdf_all[name_col_all].astype(str).unique().tolist())
+    _adm1_all_pct = sorted(gdf_all[name_col_all].astype(str).unique().tolist())
 except Exception:
-    pct_adm1_all = []
-sel_pct_adm1s = st.multiselect("Compare ADM1s for percentile charts (max 5)",
-                               options=pct_adm1_all, default=[], max_selections=5, key="pct_adm1s_h",
-                               placeholder="Type to search and select ADM1s…")
+    _adm1_all_pct = []
+
 
 def _phase_from_date(dt: pd.Timestamp, freq: str) -> int:
     if freq=="Monthly": return int(dt.month)
@@ -1008,25 +1494,67 @@ def _empirical_percentile_curve(s_df: pd.DataFrame, pct: int, freq: str) -> pd.D
     return pd.DataFrame({"date": d["date"], "p": d["_phase"].map(q)})
 
 def _pct_block(title: str, code: str, chart_key: str, story: str):
+    hide_country_key = f"{chart_key}_hide_country"
     story_col, chart_col, _ = st.columns([0.2, 0.79, 0.01], gap="large")
 
     def _s_for(area): 
         df_codes, _ = load_scope_series(iso3_now, freq, area, [code])
-        if df_codes.empty or code not in df_codes: return pd.DataFrame(columns=["date","avg"])
-        return pd.DataFrame({"date": df_codes["date"], "avg": pd.to_numeric(df_codes[code], errors="coerce")}).dropna().sort_values("date")
+        if df_codes.empty or code not in df_codes:
+            return pd.DataFrame(columns=["date","avg"])
+        return pd.DataFrame({
+            "date": pd.to_datetime(df_codes["date"], errors="coerce"),
+            "avg":  pd.to_numeric(df_codes[code], errors="coerce"),
+        }).dropna().sort_values("date")
 
-    targets = ["Country (all)"] + [a for a in sel_pct_adm1s if a != "Country (all)"]
+    # --- left: story text ---
+    with story_col:
+        st.markdown(f"**Story — {title}**  \n{story}")
+
+    # --- right (top): per-chart ADM1 selector + hide-country toggle ---
+    with chart_col:
+        try:
+            adm1_options = _adm1_all_pct
+        except NameError:
+            adm1_options = []
+
+        adm1_sel = st.multiselect(
+            "Compare ADM1s for this percentile chart (max 5)",
+            options=adm1_options,
+            default=st.session_state.get(f"{chart_key}_adm1s", []),
+            max_selections=5,
+            key=f"{chart_key}_adm1s",
+            placeholder="Type to search and select ADM1s…",
+        )
+
+        if adm1_sel:
+            hide_country = st.checkbox(
+                "Hide Country Line",
+                key=hide_country_key,
+                value=st.session_state.get(hide_country_key, False),
+                help="Hide the Country (all) line so you can compare ADM1s directly.",
+            )
+        else:
+            # No ADM1s selected: always show baseline
+            st.session_state[hide_country_key] = False
+            hide_country = False
+
+    # Decide which labels to include based on hide_country + per-chart ADM1 selection
+    has_adm1_now = bool(adm1_sel)
+    if hide_country and has_adm1_now:
+        targets = [a for a in adm1_sel if a != "Country (all)"]
+    else:
+        targets = ["Country (all)"] + [a for a in adm1_sel if a != "Country (all)"]
+
     sdict = {g: _s_for(g) for g in targets}
-    sdict = {k:v for k,v in sdict.items() if not v.empty}
+    sdict = {k: v for k, v in sdict.items() if not v.empty}
     if not sdict:
-        with story_col: st.info("No data for percentiles.")
+        with chart_col:
+            st.info("No data for percentiles.")
         return
 
     dmin = min(s["date"].min() for s in sdict.values()).date()
     dmax = max(s["date"].max() for s in sdict.values()).date()
 
-    with story_col:
-        st.markdown(f"**Story — {title}**  \n{story}")
 
     with chart_col:
         if freq == "Seasonal":
@@ -1068,7 +1596,7 @@ def _pct_block(title: str, code: str, chart_key: str, story: str):
                     line=dict(color=color, width=1.2, dash="dot"),
                 ))
 
-        fig.update_layout(title=title, height=420, margin=dict(l=30,r=30,t=40,b=50),
+        fig.update_layout(title=title, height=420, margin=dict(l=30,r=30,t=40,b=80),
                           hovermode="x unified", xaxis_title="Date", yaxis_title="%")
         set_legend_top(fig)
         if freq == "Monthly": fig.update_xaxes(tickformat="%b\n%Y")
@@ -1082,4 +1610,3 @@ for _title, _code, _key in [
     ("Minimum Relative Humidity — Percentiles", "HUMN", "pct_humn"),
 ]:
     _pct_block(_title, _code, _key, _pct_story)
-
