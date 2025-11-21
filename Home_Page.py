@@ -708,6 +708,29 @@ else:
     )
     plot_df["val"] = plot_df["has_data_any"].astype(float)
 
+    with st.expander("Debug: world map (remove later)"):
+    import plotly
+    st.write("Streamlit version:", st.__version__)
+    st.write("Plotly version:", plotly.__version__)
+
+    try:
+        import streamlit_plotly_events as spe
+        st.write(
+            "streamlit_plotly_events version:",
+            getattr(spe, "__version__", "unknown"),
+        )
+    except Exception as e:
+        st.write("streamlit_plotly_events import FAILED:", e)
+
+    st.write("plotly_events is None:", plotly_events is None)
+    st.write(
+        "AVAILABLE_INDICATORS:", AVAILABLE_INDICATORS,
+        "| has_data_any counts:",
+        all_countries["has_data_any"].value_counts(dropna=False).to_dict(),
+    )
+    st.write("plot_df[val] describe:", plot_df["val"].describe())
+
+
     map_h = 800  # vertical height
     scope_map = {
         "World": "world",
@@ -760,6 +783,9 @@ else:
 
     # Full-bleed wrapper (same CSS you already have at the top)
     st.markdown('<div class="full-bleed">', unsafe_allow_html=True)
+
+    st.write("DEBUG: map click events:", events)
+
 
     events = []
     if plotly_events is not None:
